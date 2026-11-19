@@ -1,0 +1,967 @@
+mod wire;
+use wire::OriginIo;
+
+use super::{Binding, Data, Kind, Resource, ResourceHandle, Resources};
+
+use bytes::{Bytes, BytesMut};
+use hyper::body::{self, Frame, SizeHint};
+use hyper::header::{
+    ACCESS_CONTROL_ALLOW_ORIGIN, ALLOW, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue,
+};
+use hyper::server::conn::{http1, http2};
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::fs::{self, File};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::spawn;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+use tokio_rustls::TlsAcceptor;
+
+use std::convert::Infallible;
+use std::io;
+use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+enum ServingRoot {
+    File(PathBuf),
+    Directory(PathBuf),
+}
+
+impl ServingRoot {
+    fn path(&self) -> &Path {
+        match self {
+            Self::File(path) | Self::Directory(path) => path,
+        }
+    }
+
+    fn contains(&self, target: &Path) -> bool {
+        match self {
+            Self::File(path) => target == path,
+            Self::Directory(path) => target.starts_with(path),
+        }
+    }
+}
+
+struct FileBody {
+    file: Option<File>,
+    remaining: u64,
+    buf: BytesMut,
+}
+
+impl FileBody {
+    fn empty() -> Self {
+        Self {
+            file: None,
+            remaining: 0,
+            buf: BytesMut::new(),
+        }
+    }
+}
+
+impl body::Body for FileBody {
+    type Data = Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let Self {
+            file,
+            remaining,
+            buf,
+        } = self.get_mut();
+        if *remaining == 0 {
+            return Poll::Ready(None);
+        }
+        let Some(file) = file else {
+            return Poll::Ready(None);
+        };
+        let len = usize::try_from((*remaining).min(65536)).unwrap_or(65536);
+        buf.resize(len, 0);
+        let mut read = ReadBuf::new(buf);
+        match Pin::new(file).poll_read(cx, &mut read) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => {
+                *remaining = 0;
+                Poll::Ready(Some(Err(e)))
+            }
+            Poll::Ready(Ok(())) => {
+                let n = read.filled().len();
+                if n == 0 {
+                    *remaining = 0;
+                    return Poll::Ready(Some(Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Served file shortened during transfer",
+                    ))));
+                }
+                *remaining = remaining.saturating_sub(n as u64);
+                // ReadBuf reports at most the supplied buffer length, so `n`
+                // is at most buf.len() and split_to cannot panic.
+                Poll::Ready(Some(Ok(Frame::data(buf.split_to(n).freeze()))))
+            }
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.remaining)
+    }
+}
+
+impl Resources {
+    /// Validates the serving root and starts a loopback HTTP(S) server.
+    ///
+    /// HTTPS uses a generated self-signed certificate. `http2` selects HTTP/2
+    /// exclusively; a false value selects HTTP/1.1 and requires HTTPS.
+    pub async fn serve_file(
+        &self,
+        client_file: String,
+        client_port: u16,
+        https: bool,
+        http2: bool,
+    ) -> Result<ResourceHandle, String> {
+        if !https && !http2 {
+            return Err("At least one of https and http2 must be true".to_owned());
+        }
+        let root = self.client_path(&client_file)?;
+        let root = fs::canonicalize(&root)
+            .await
+            .map_err(|e| format!("Resolve HTTP serving root {}: {e}", root.display()))?;
+        let metadata = fs::metadata(&root)
+            .await
+            .map_err(|e| format!("Inspect HTTP serving root {}: {e}", root.display()))?;
+        if !metadata.is_dir() && !metadata.is_file() {
+            return Err("HTTP serving root must be a regular file or directory".to_owned());
+        }
+        let root = if metadata.is_file() {
+            ServingRoot::File(root)
+        } else {
+            ServingRoot::Directory(root)
+        };
+        let (binding, outcome) = watch::channel(Binding::Pending);
+        let mut resource = Resource::new(
+            Data::Http {
+                path: root.path().to_owned(),
+                binding: outcome,
+            },
+            &self.stop,
+            &self.owner,
+        );
+        let stop = resource.stop.clone();
+        let errors = self.errors.clone();
+        resource.task = Some(spawn(async move {
+            if stop.is_cancelled() {
+                return;
+            }
+            let startup = async {
+                let tls = if https {
+                    Some(tls_acceptor(http2)?)
+                } else {
+                    None
+                };
+                let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, client_port))
+                    .await
+                    .map_err(|e| format!("Bind HTTP server on 127.0.0.1:{client_port}: {e}"))?;
+                let port = listener
+                    .local_addr()
+                    .map_err(|e| format!("Read HTTP server port: {e}"))?
+                    .port();
+                Ok::<_, String>((listener, port, tls))
+            };
+            let (listener, port, tls) = tokio::select! {
+                biased;
+                _ = stop.cancelled() => return,
+                ret = startup => match ret {
+                    Ok(ret) => ret,
+                    Err(e) => { binding.send_replace(Binding::Failed(e.clone())); let _ = errors.send(e); return; }
+                }
+            };
+            binding.send_replace(Binding::Ready(port));
+            let scheme = if https { "https" } else { "http" };
+            let origin = format!("{scheme}://127.0.0.1:{port}");
+            let root = Arc::new(root);
+            let mut clients = JoinSet::new();
+            // Drain completed tasks even while the accept queue stays ready.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    _ = clients.join_next(), if !clients.is_empty() => {},
+                    accepted = listener.accept() => match accepted {
+                        Ok((socket, _)) => {
+                            let root = root.clone();
+                            let origin = origin.clone();
+                            let tls = tls.clone();
+                            let stop = stop.clone();
+                            let errors = errors.clone();
+                            clients.spawn(async move {
+                                let serving = serve_connection(socket, tls, http2, root, origin);
+                                tokio::select! {
+                                    biased;
+                                    _ = stop.cancelled() => {},
+                                    ret = serving => if let Err(e) = ret { let _ = errors.send(e); },
+                                }
+                            });
+                        }
+                        Err(e) => { let _ = errors.send(format!("Accept HTTP connection: {e}")); break; }
+                    },
+                }
+            }
+            clients.abort_all();
+            while clients.join_next().await.is_some() {}
+        }));
+        self.insert(resource).await
+    }
+
+    /// Waits asynchronously for an HTTP server's assigned listener port.
+    ///
+    /// Returns `None` if the pending operation is cleared while waiting.
+    pub async fn get_http_port(&self, handle: ResourceHandle) -> Result<Option<u16>, String> {
+        self.port(handle, Kind::Http).await
+    }
+
+    /// Cancels server startup or closes the HTTP listener and active clients.
+    ///
+    /// Returns whether a window association was removed. The application must
+    /// close that window through its backend when this returns `true`.
+    pub async fn clear_http(&self, handle: ResourceHandle) -> bool {
+        if let Some(resource) = self.take(handle, &[Kind::Http, Kind::Reserved]).await {
+            let window = resource.data.kind() == Kind::Reserved;
+            self.stop(resource).await;
+            window
+        } else {
+            false
+        }
+    }
+
+    /// Returns handles for windows associated with this attachment.
+    pub async fn windows(&self) -> Vec<ResourceHandle> {
+        self.registry
+            .state
+            .lock()
+            .await
+            .entries
+            .iter()
+            .filter_map(|(handle, resource)| {
+                (Arc::ptr_eq(&resource.owner, &self.owner)
+                    && resource.data.kind() == Kind::Reserved)
+                    .then_some(*handle)
+            })
+            .collect()
+    }
+}
+
+fn tls_acceptor(http2: bool) -> Result<TlsAcceptor, String> {
+    use rcgen::generate_simple_self_signed;
+
+    use tokio_rustls::rustls::ServerConfig;
+    use tokio_rustls::rustls::crypto::ring;
+    use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
+
+    let cert = generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+        .map_err(|e| format!("Generate HTTP certificate: {e}"))?;
+    let key = PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der());
+    let provider = ring::default_provider();
+    let mut config = ServerConfig::builder_with_provider(Arc::new(provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| e.to_string())?
+        .with_no_client_auth()
+        .with_single_cert(vec![cert.cert.der().clone()], key.into())
+        .map_err(|e| e.to_string())?;
+    config.alpn_protocols = vec![if http2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    }];
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+async fn serve_connection(
+    socket: TcpStream,
+    tls: Option<TlsAcceptor>,
+    http2: bool,
+    root: Arc<ServingRoot>,
+    origin: String,
+) -> Result<(), String> {
+    if let Some(tls) = tls {
+        let stream = tls
+            .accept(socket)
+            .await
+            .map_err(|e| format!("Accept HTTPS handshake: {e}"))?;
+        serve_stream(stream, http2, root, origin).await
+    } else {
+        serve_stream(socket, http2, root, origin).await
+    }
+}
+
+async fn serve_stream<S>(
+    stream: S,
+    http2: bool,
+    root: Arc<ServingRoot>,
+    origin: String,
+) -> Result<(), String>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request| {
+        let root = root.clone();
+        let origin = origin.clone();
+        async move { Ok::<_, Infallible>(response(request, &root, &origin, http2).await) }
+    });
+    if http2 {
+        http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
+            .await
+            .map_err(|e| format!("Serve HTTP/2 connection: {e}"))
+    } else {
+        http1::Builder::new()
+            .serve_connection(TokioIo::new(OriginIo::new(stream)), service)
+            .await
+            .map_err(|e| format!("Serve HTTP/1.1 connection: {e}"))
+    }
+}
+
+async fn response<B>(
+    request: Request<B>,
+    root: &ServingRoot,
+    origin: &str,
+    http2: bool,
+) -> Response<FileBody> {
+    let mut ret = file_response(&request, root, http2).await;
+    if let Ok(origin) = origin.parse() {
+        ret.headers_mut()
+            .insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
+    }
+    ret
+}
+
+fn empty(status: StatusCode) -> Response<FileBody> {
+    let mut ret = Response::new(FileBody::empty());
+    *ret.status_mut() = status;
+    ret
+}
+
+async fn file_response<B>(
+    request: &Request<B>,
+    root: &ServingRoot,
+    http2: bool,
+) -> Response<FileBody> {
+    let head = request.method() == Method::HEAD && http2;
+    if request.method() != Method::GET && !head {
+        let mut ret = empty(StatusCode::METHOD_NOT_ALLOWED);
+        ret.headers_mut().insert(
+            ALLOW,
+            HeaderValue::from_static(if http2 { "GET, HEAD" } else { "GET" }),
+        );
+        return ret;
+    }
+    if request.headers().get_all(CONNECTION).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+        })
+    }) {
+        return empty(StatusCode::BAD_REQUEST);
+    }
+    let Some(path) = decode_path(request.uri().path()) else {
+        return empty(StatusCode::BAD_REQUEST);
+    };
+    let Some(path) = path.strip_prefix('/') else {
+        return empty(StatusCode::BAD_REQUEST);
+    };
+    let target = if path.is_empty() {
+        root.path().to_owned()
+    } else {
+        root.path().join(path.trim_start_matches('/'))
+    };
+    let target = match resolve_missing(&target).await {
+        Ok(target) => target,
+        Err(e) => {
+            return empty(
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+            );
+        }
+    };
+    if !root.contains(&target) {
+        return empty(StatusCode::BAD_REQUEST);
+    }
+    match fs::metadata(&target).await {
+        Ok(metadata) if !metadata.is_file() => return empty(StatusCode::BAD_REQUEST),
+        Ok(_) => {}
+        Err(e) => {
+            return empty(
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+            );
+        }
+    }
+    let file = match File::open(&target).await {
+        Ok(file) => file,
+        Err(e) => {
+            return empty(
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+                ) {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                },
+            );
+        }
+    };
+    let metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
+        Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
+    };
+    if !metadata.is_file() {
+        return empty(StatusCode::BAD_REQUEST);
+    }
+    // Path resolution alone is insufficient: a symlink can be replaced before
+    // open. Inspect the actual opened descriptor before exposing any bytes.
+    match opened_path(&file) {
+        Ok(path) if root.contains(&path) => {}
+        Ok(_) => return empty(StatusCode::BAD_REQUEST),
+        Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
+    }
+    let len = metadata.len();
+    let body = if head {
+        FileBody::empty()
+    } else {
+        FileBody {
+            file: Some(file),
+            remaining: len,
+            buf: BytesMut::new(),
+        }
+    };
+    let mut ret = Response::new(body);
+    ret.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static(content_type(&target)),
+    );
+    if let Ok(len) = len.to_string().parse() {
+        ret.headers_mut().insert(CONTENT_LENGTH, len);
+    }
+    ret
+}
+
+#[cfg(target_os = "linux")]
+fn opened_path(file: &File) -> io::Result<PathBuf> {
+    use std::fs::read_link;
+    use std::os::fd::AsRawFd as _;
+
+    read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn opened_path(file: &File) -> io::Result<PathBuf> {
+    use libc::{F_GETPATH, PATH_MAX, fcntl};
+
+    use std::ffi::{CStr, OsStr};
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let mut buf = [0_u8; PATH_MAX as usize];
+    // F_GETPATH writes at most PATH_MAX bytes into the supplied buffer.
+    let ret = unsafe { fcntl(file.as_raw_fd(), F_GETPATH, buf.as_mut_ptr()) };
+    if ret < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let path = CStr::from_bytes_until_nul(&buf).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Opened file path is not terminated",
+        )
+    })?;
+    Ok(PathBuf::from(OsStr::from_bytes(path.to_bytes())))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn opened_path(_: &File) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Opened-file confinement is unavailable on this platform",
+    ))
+}
+
+fn decode_path(path: &str) -> Option<String> {
+    let mut ret = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let high = (bytes.next()? as char).to_digit(16)?;
+            let low = (bytes.next()? as char).to_digit(16)?;
+            let byte = u8::try_from(high.checked_mul(16)?.checked_add(low)?).ok()?;
+            if byte == 0 {
+                return None;
+            }
+            ret.push(byte);
+        } else {
+            ret.push(byte);
+        }
+    }
+    String::from_utf8(ret).ok()
+}
+
+async fn resolve_missing(path: &Path) -> io::Result<PathBuf> {
+    use super::path::resolve;
+
+    use tokio::task::spawn_blocking;
+
+    let path = path.to_owned();
+    spawn_blocking(move || resolve(&path))
+        .await
+        .map_err(io::Error::other)?
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|name| name.to_str()) {
+        Some("html" | "htm") => "text/html; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("js" | "mjs") => "text/javascript; charset=utf-8",
+        Some("json") => "application/json",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("txt" | "md") => "text/plain; charset=utf-8",
+        Some("wasm") => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use hyper::body::Body as _;
+
+    use http_body_util::{BodyExt as _, Empty};
+    use tempfile::tempdir;
+
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
+
+    use std::fs as std_fs;
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
+
+    #[test]
+    fn decodes_path_once_without_reparsing_delimiters() {
+        assert_eq!(
+            decode_path("/a%23b%3Fc%20%E6%97%A5"),
+            Some("/a#b?c 日".to_owned())
+        );
+        assert_eq!(decode_path("/%252e%252e"), Some("/%2e%2e".to_owned()));
+        assert_eq!(decode_path("/%00"), None);
+        assert_eq!(decode_path("/%z0"), None);
+    }
+
+    #[tokio::test]
+    async fn serves_files_and_confines_symlinks() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        fs::create_dir(&root).await.unwrap();
+        fs::write(root.join("a#b?c 日"), b"hello").await.unwrap();
+        fs::write(dir.path().join("outside"), b"secret")
+            .await
+            .unwrap();
+        symlink(dir.path().join("outside"), root.join("link")).unwrap();
+        let serving = ServingRoot::Directory(root.clone());
+        for (path, status) in [
+            ("/a%23b%3Fc%20%E6%97%A5", StatusCode::OK),
+            ("/", StatusCode::BAD_REQUEST),
+            ("/missing", StatusCode::BAD_REQUEST),
+            ("/link", StatusCode::BAD_REQUEST),
+            ("/../outside", StatusCode::BAD_REQUEST),
+        ] {
+            let request = Request::builder().uri(path).body(()).unwrap();
+            let ret = response(request, &serving, "http://127.0.0.1:1234", true).await;
+            assert_eq!(ret.status(), status, "{path}");
+            assert_eq!(
+                ret.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+                "http://127.0.0.1:1234"
+            );
+            if status != StatusCode::OK {
+                assert_eq!(ret.body().size_hint().exact(), Some(0));
+            }
+        }
+        let ret = response(
+            Request::builder()
+                .method(Method::HEAD)
+                .uri("/a%23b%3Fc%20%E6%97%A5")
+                .body(())
+                .unwrap(),
+            &serving,
+            "http://127.0.0.1:1234",
+            true,
+        )
+        .await;
+        assert_eq!(ret.headers()[CONTENT_LENGTH], "5");
+        assert!(ret.body().is_end_stream());
+    }
+
+    #[tokio::test]
+    async fn never_serves_outside_bytes_when_a_path_is_replaced_by_a_symlink() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std_fs::create_dir(&root).unwrap();
+        std_fs::write(dir.path().join("outside"), b"secret").unwrap();
+        std_fs::write(root.join("changing"), b"public").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker_root = root.clone();
+        let outside = dir.path().join("outside");
+        let serving = ServingRoot::Directory(root.clone());
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Acquire) {
+                let next = worker_root.join("next");
+                if symlink(&outside, &next).is_err() {
+                    break;
+                }
+                if std_fs::rename(&next, worker_root.join("changing")).is_err() {
+                    break;
+                }
+                if std_fs::write(&next, b"public").is_err() {
+                    break;
+                }
+                if std_fs::rename(&next, worker_root.join("changing")).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut leaked = false;
+        for _ in 0..200 {
+            let response = file_response(
+                &Request::builder().uri("/changing").body(()).unwrap(),
+                &serving,
+                true,
+            )
+            .await;
+            if let Ok(body) = response.into_body().collect().await {
+                leaked |= body.to_bytes() == "secret";
+            }
+        }
+        stop.store(true, Ordering::Release);
+        worker.join().unwrap();
+        assert!(!leaked);
+    }
+
+    #[tokio::test]
+    async fn file_roots_never_expand_their_scope_to_descendants() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("root");
+        fs::write(&path, b"original").await.unwrap();
+        let root = ServingRoot::File(path.clone());
+        let response =
+            file_response(&Request::builder().uri("/").body(()).unwrap(), &root, true).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "original"
+        );
+        fs::remove_file(&path).await.unwrap();
+        fs::create_dir(&path).await.unwrap();
+        fs::write(path.join("child"), b"outside the file scope")
+            .await
+            .unwrap();
+        let response = file_response(
+            &Request::builder().uri("/child").body(()).unwrap(),
+            &root,
+            true,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .len(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn serves_http2_over_loopback_and_reports_binding_failure() {
+        use hyper::client::conn::http2 as client_http2;
+
+        use tokio::task::yield_now;
+
+        timeout(Duration::from_secs(5), async {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("hello.html"), b"<h1>Hello</h1>")
+                .await
+                .unwrap();
+            let (errors, mut messages) = mpsc::unbounded_channel();
+            let resources = Resources::new(dir.path().to_owned(), errors);
+            assert!(
+                resources
+                    .serve_file("hello.html".to_owned(), 0, false, false)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                resources
+                    .serve_file("missing".to_owned(), 0, false, true)
+                    .await
+                    .is_err()
+            );
+            let handle = resources
+                .serve_file("/hello.html".to_owned(), 0, false, true)
+                .await
+                .unwrap();
+            let port = resources.get_http_port(handle).await.unwrap().unwrap();
+            let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+            let (mut client, connection) =
+                client_http2::handshake(TokioExecutor::new(), TokioIo::new(socket))
+                    .await
+                    .unwrap();
+            let connection = spawn(connection);
+            let request = Request::builder()
+                .uri(format!("http://127.0.0.1:{port}/"))
+                .body(Empty::<Bytes>::new())
+                .unwrap();
+            let response = client.send_request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+            assert_eq!(response.headers()[CONTENT_LENGTH], "14");
+            assert_eq!(
+                response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+                format!("http://127.0.0.1:{port}")
+            );
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                "<h1>Hello</h1>"
+            );
+            let busy = resources
+                .serve_file("hello.html".to_owned(), port, false, true)
+                .await
+                .unwrap();
+            let error = resources.get_http_port(busy).await.unwrap_err();
+            assert!(error.contains("Bind HTTP server"));
+            assert_eq!(messages.recv().await.unwrap(), error);
+            resources.clear_http(handle).await;
+            loop {
+                match TcpListener::bind(("127.0.0.1", port)).await {
+                    Ok(listener) => {
+                        drop(listener);
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
+                        yield_now().await;
+                    }
+                    Err(e) => panic!("Rebind cleared HTTP port: {e}"),
+                }
+            }
+            drop(client);
+            connection.abort();
+            resources.cleanup().await;
+            assert!(resources.reserve().await.is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires curl and permission to bind loopback sockets"]
+    async fn serves_https_with_a_self_signed_certificate() {
+        use tokio::process::Command;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("hello.txt"), b"HTTPS works")
+            .await
+            .unwrap();
+        let (errors, mut messages) = mpsc::unbounded_channel();
+        let resources = Resources::new(dir.path().to_owned(), errors);
+        let handle = resources
+            .serve_file("hello.txt".to_owned(), 0, true, false)
+            .await
+            .unwrap();
+        let port = resources.get_http_port(handle).await.unwrap().unwrap();
+        let output = Command::new("curl")
+            .args([
+                "--insecure",
+                "--http1.1",
+                "--max-time",
+                "5",
+                "--silent",
+                "--show-error",
+                "--fail",
+            ])
+            .arg(format!("https://127.0.0.1:{port}/"))
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, b"HTTPS works");
+        resources.cleanup().await;
+        assert!(messages.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn serves_percent_encoded_ascii_path_data_without_reinterpreting_delimiters() {
+        use std::fmt::Write as _;
+        let dir = tempdir().unwrap();
+        let root = ServingRoot::Directory(std_fs::canonicalize(dir.path()).unwrap());
+        for byte in 0x20_u8..=0x7e {
+            let name = if byte == b'/' {
+                "a/b".to_owned()
+            } else {
+                format!("a{}b", char::from(byte))
+            };
+            let target = dir.path().join(&name);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).await.unwrap();
+            }
+            fs::write(&target, [byte]).await.unwrap();
+            let mut uri = String::from("/a");
+            write!(uri, "%{byte:02X}b").unwrap();
+            let ret =
+                file_response(&Request::builder().uri(uri).body(()).unwrap(), &root, true).await;
+            assert_eq!(ret.status(), StatusCode::OK, "{name:?}");
+            assert_eq!(
+                ret.into_body().collect().await.unwrap().to_bytes().as_ref(),
+                [byte],
+                "{name:?}"
+            );
+            fs::remove_file(target).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn serving_roots_and_clear_targets_remain_confined() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("client");
+        let outside = dir.path().join("outside");
+        fs::create_dir(&base).await.unwrap();
+        fs::write(&outside, b"secret").await.unwrap();
+        symlink(&outside, base.join("escape")).unwrap();
+        let (errors, _messages) = mpsc::unbounded_channel();
+        let resources = Resources::new(base.clone(), errors);
+        for input in ["", ".", "/", "escape", "../outside"] {
+            assert!(
+                resources
+                    .serve_file(input.to_owned(), 0, false, true)
+                    .await
+                    .is_err(),
+                "{input:?}"
+            );
+        }
+        let handle = resources.reserve().await.unwrap();
+        assert!(resources.clear_http(handle).await);
+        assert!(!resources.clear_http(handle).await);
+        assert_eq!(fs::read(outside).await.unwrap(), b"secret");
+    }
+
+    #[tokio::test]
+    async fn malformed_requests_do_not_emit_responses_without_an_origin() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+        timeout(Duration::from_secs(5), async {
+            let dir = tempdir().unwrap();
+            let file = dir.path().join("file");
+            fs::write(&file, b"abc").await.unwrap();
+            let root = Arc::new(ServingRoot::File(file));
+            for after_response in [false, true] {
+                let (mut client, server) = duplex(8192);
+                let server = spawn(serve_stream(
+                    server,
+                    false,
+                    root.clone(),
+                    "http://127.0.0.1:1234".to_owned(),
+                ));
+                if after_response {
+                    client
+                        .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut header = Vec::new();
+                    while !header.ends_with(b"\r\n\r\n") {
+                        header.push(client.read_u8().await.unwrap());
+                    }
+                    assert!(
+                        String::from_utf8_lossy(&header)
+                            .contains("access-control-allow-origin: http://127.0.0.1:1234")
+                    );
+                    let mut body = [0; 3];
+                    client.read_exact(&mut body).await.unwrap();
+                    assert_eq!(&body, b"abc");
+                }
+                client
+                    .write_all(b"GET / HTTP/1.1\r\ninvalid header\r\n\r\n")
+                    .await
+                    .unwrap();
+                client.shutdown().await.unwrap();
+                let mut response = Vec::new();
+                client.read_to_end(&mut response).await.unwrap();
+                assert!(
+                    response.is_empty(),
+                    "{after_response}: {}",
+                    String::from_utf8_lossy(&response)
+                );
+                assert!(server.await.unwrap().is_err());
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_methods_advertise_the_accepted_methods() {
+        let root = ServingRoot::Directory(PathBuf::from("/unused"));
+        for (http2, allowed) in [(false, "GET"), (true, "GET, HEAD")] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/")
+                .body(())
+                .unwrap();
+            let ret = response(request, &root, "http://127.0.0.1:1234", http2).await;
+            assert_eq!(ret.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(ret.headers()[ALLOW], allowed);
+            assert_eq!(
+                ret.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
+                "http://127.0.0.1:1234"
+            );
+            assert!(
+                ret.into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .is_empty()
+            );
+        }
+    }
+}

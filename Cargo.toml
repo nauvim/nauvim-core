@@ -1,0 +1,77 @@
+[package]
+name = "nauvim-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "UI-independent Nauvim session and plugin engine"
+readme = "README.md"
+
+[features]
+default = [
+    "ssh",
+    "plugin-local-forward",
+    "plugin-filesystem",
+    "plugin-http",
+    "plugin-clipboard",
+]
+ssh = ["dep:openrussh-client", "dep:russh-sftp"]
+plugin-local-forward = []
+plugin-filesystem = []
+plugin-http = [
+    "dep:bytes",
+    "dep:url",
+    "dep:hyper",
+    "dep:hyper-util",
+    "dep:tokio-rustls",
+    "dep:rcgen",
+    "dep:libc",
+]
+plugin-clipboard = []
+
+[dependencies]
+nvim-rpc-plugin = "0.2"
+nvim-rpc-ui = "0.1"
+mlua = { version = "0.11", features = ["lua54", "vendored", "send"] }
+directories = "6"
+tempfile = "3"
+tokio = { version = "1", features = [
+    "rt",
+    "macros",
+    "net",
+    "process",
+    "io-util",
+    "sync",
+    "time",
+    "signal",
+    "fs",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+bytes = { version = "1", optional = true }
+getrandom = "0.3"
+url = { version = "2", optional = true }
+openrussh-client = { version = "0.4.6", optional = true, default-features = false, features = [
+    "ring",
+    "rsa",
+    "config-parser",
+    "known-hosts",
+    "process",
+    "local-tcp-forwarding",
+    "local-stream-forwarding",
+] }
+russh-sftp = { version = "2.4", optional = true }
+hyper = { version = "1", optional = true, features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+rcgen = { version = "0.14", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
+hyper = { version = "1", features = ["client", "http2"] }
+http-body-util = "0.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
