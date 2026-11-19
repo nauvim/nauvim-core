@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 //! UI-independent Nauvim sessions, Lua configuration, and client resources.
 //!
 //! Load [`Config`], construct an [`Engine`], and consume [`EngineEvent`] values

@@ -4,7 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "UI-independent Nauvim session and plugin engine"
+repository = "https://github.com/nauvim/nauvim-core"
+documentation = "https://docs.rs/nauvim-core"
 readme = "README.md"
+keywords = ["neovim", "nauvim", "rpc", "ssh"]
+categories = ["api-bindings", "asynchronous", "text-editors"]
+
+[package.metadata.docs.rs]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
 
 [features]
 default = [
