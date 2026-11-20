@@ -1469,9 +1469,9 @@ checksum = "7639c3d18f948163af8d82f125d3e03891050ecc438a7c37fde6369672b8ebea"
 
 [[package]]
 name = "nvim-rpc-ui"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4e2d2999716c215b83262f9e12bec7e5692b84a72b4759a9184970088f97878"
+checksum = "60a86d3196a522c9c7bf5a5dd782036fe3d618b3d66bfaba34f5a70fb011ae14"
 dependencies = [
  "nvim-rpc",
  "nvim-rpc-plugin",
