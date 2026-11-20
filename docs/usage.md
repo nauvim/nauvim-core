@@ -6,7 +6,8 @@ integration, see the [frontend implementor guide](implementors.md).
 
 ## Loading configuration
 
-Pass an optional path to `Config::load()`. The default is
+The frontend passes an optional path, its UI implementation ID, and its UI-option
+parser to `Config::load()`. The default path is
 `$XDG_CONFIG_HOME/nauvim/init.lua`, using the platform configuration directory
 when `XDG_CONFIG_HOME` is unset. The engine evaluates the file using vendored
 Lua 5.4 in the client environment.
@@ -19,13 +20,19 @@ The engine prepends `ROOT/lua/?.lua;ROOT/lua/?/init.lua` to `package.path`, wher
 templates. Neovim runtime directories are not added.
 
 A read, execution, information-acquisition, or validation failure selects the
-complete default configuration. `Config::diagnostics()` retains the error;
-`Engine::next_event()` emits it as `EngineEvent::Error`. `Config::evaluate()` is
-also available for supplied source and client information. It returns evaluation
-errors directly rather than applying the file-loading fallback.
+complete default configuration, including an empty UI-option dictionary. This
+includes failures from the frontend's selected-option parser.
+`Config::diagnostics()` retains the error; `Engine::next_event()` emits it as
+`EngineEvent::Error`. `Config::evaluate()` is also available for supplied source
+and client information. It returns evaluation and validation errors directly
+rather than applying the file-loading fallback. See
+[UI-specific configuration](#ui-specific-configuration) for selection and
+[frontend integration](implementors.md#ui-specific-configuration) for the parser
+interface.
 
-The file returns a configuration table. Predefined field names use snake_case;
-host aliases are case-sensitive strings and can contain punctuation.
+The file returns a configuration table. Predefined field names use snake_case,
+except within UI-specific option dictionaries. Host aliases are case-sensitive
+strings and can contain punctuation.
 
 ```lua
 local client = require("nauvim-client-info")
@@ -41,7 +48,6 @@ return {
             },
         },
     },
-    fonts = { family = "monospace", size = 12 },
     clipboard = { backend = "auto" },
 }
 ```
@@ -195,12 +201,50 @@ applies to GUI paste and plugin copy notifications. See
 [clipboard and GUI paste](implementors.md#clipboard-and-gui-paste) for input,
 event-loop, and error-handling contracts.
 
-## Fonts
+<a id="fonts"></a>
 
-`fonts` accepts a family string, a `{ family = string, size = integer }` record,
-or a sequence of those records. Record sizes default to 12. The built-in font
-setting is `monospace` with size 12. `Config::fonts()` exposes the configured order.
-The application implements font discovery, measurement, and rendering.
+## UI-specific configuration
+
+`ui_opts` maps selection keys to option dictionaries. Omission or nil means an
+empty mapping. `use_ui_opts` is a string or nil and defaults to nil. The frontend
+documents its UI implementation ID and its option schema, including font
+settings and defaults. Core defines no font schema or font defaults.
+
+For example, assume the frontend documents the ID `org.example.nauvim.gui` and
+accepts the following `fonts` setting:
+
+```lua
+return {
+    ui_opts = {
+        ["org.example.nauvim.gui"] = {
+            fonts = { { family = "Example Mono", size = 16 } },
+        },
+        ["shared-settings"] = {},
+    },
+    -- use_ui_opts = "shared-settings",
+}
+```
+
+The ID, schema, and values in this example are illustrative. With `use_ui_opts`
+omitted, core selects the entry matching the frontend's supplied ID exactly.
+Setting `use_ui_opts = "shared-settings"` selects that key instead. An absent or
+nil entry yields an empty dictionary. An explicit selector that has no entry
+also yields an empty dictionary; it does not fall back to the implementation ID.
+Selection never merges dictionaries.
+
+Every outer mapping key, non-nil selector, and supplied implementation ID must
+be non-empty valid UTF-8, must not begin with U+FEFF, and must not contain NUL.
+Every non-nil entry must be a dictionary with string keys. Functions are rejected
+at every nesting level, including nested table keys and values. Core checks
+these common requirements for all entries, including unselected entries.
+
+Beyond those checks, option contents are opaque to core. Dictionary field names
+need not use snake_case, and inner strings and numbers receive no additional
+encoding or range restrictions. The frontend interprets and validates only the
+selected dictionary against its own schema. Unselected dictionaries receive
+common validation only. A common or selected-schema validation failure during
+file loading selects the complete default configuration and produces a
+diagnostic as described under [loading configuration](#loading-configuration).
 
 ## Events and cleanup
 

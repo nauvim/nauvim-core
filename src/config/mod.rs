@@ -11,17 +11,12 @@ mod info;
 pub use info::{HostInfo, ProjectDirs};
 mod clipboard;
 pub use clipboard::ClipboardConfig;
+mod ui_opts;
+pub use ui_opts::{UiConfig, UiObjectId, UiTable, UiTableId, UiValue};
 pub(crate) mod program;
 use program::ProgramSetting;
 #[cfg(feature = "ssh")]
 pub(crate) mod ssh;
-
-/// A configured fallback font, in priority order.
-#[derive(Debug, Clone)]
-pub struct Font {
-    pub family: String,
-    pub size: i64,
-}
 
 /// Client resource permissions for one attachment.
 #[derive(Debug, Clone, Copy)]
@@ -110,7 +105,6 @@ pub struct Config {
     pub(crate) default_spec: Host,
     pub(crate) client: Option<HostInfo>,
     default_host: Option<String>,
-    fonts: Vec<Font>,
     clipboard: ClipboardConfig,
     diagnostics: Vec<String>,
     #[cfg(feature = "ssh")]
@@ -131,10 +125,6 @@ impl Default for Config {
             default_spec: Host::default(),
             client: None,
             default_host: None,
-            fonts: vec![Font {
-                family: "monospace".into(),
-                size: 12,
-            }],
             clipboard: ClipboardConfig::default(),
             diagnostics: Vec::new(),
             #[cfg(feature = "ssh")]
@@ -146,25 +136,48 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Loads a Lua configuration and retains failures as startup diagnostics.
+    /// Loads configuration and parses the selected UI-specific dictionary.
     ///
-    /// Reading, execution, validation, or client-information failures select
-    /// the complete default configuration. The engine emits the diagnostic
-    /// through its error interface.
-    pub fn load(path: Option<&Path>) -> Result<Self, Error> {
-        match Self::try_load(path) {
+    /// `ui_id` identifies the frontend implementation. It must be non-empty,
+    /// must not begin with U+FEFF, and must not contain NUL. `parse_ui_opts` interprets
+    /// and validates only its selected dictionary and returns the frontend's
+    /// settings alongside the core configuration. Pass `|opts| Ok(opts)` to
+    /// receive the owned Rust dictionary directly.
+    ///
+    /// Reading, execution, common validation, selected-schema validation, or
+    /// client-information failures select the complete default configuration.
+    /// The parser is then called with an empty dictionary. The engine emits the
+    /// original failure through its error interface. An invalid `ui_id`, or a
+    /// parser that rejects the empty default dictionary, returns an error.
+    pub fn load<T>(
+        path: Option<&Path>,
+        ui_id: &str,
+        mut parse_ui_opts: impl FnMut(UiConfig) -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
+        ui_opts::validate_id(ui_id)?;
+        match Self::try_load(path, ui_id, &mut parse_ui_opts) {
             Ok(config) => Ok(config),
             Err(e) => {
                 let mut config = Self::default();
                 config
                     .diagnostics
                     .push(format!("Load Nauvim configuration: {e}"));
-                Ok(config)
+                let opts = parse_ui_opts(UiConfig::default()).map_err(|defaults| {
+                    Error::DefaultUiOptions {
+                        configuration: Box::new(e),
+                        defaults: Box::new(defaults),
+                    }
+                })?;
+                Ok((config, opts))
             }
         }
     }
 
-    fn try_load(path: Option<&Path>) -> Result<Self, Error> {
+    fn try_load<T>(
+        path: Option<&Path>,
+        ui_id: &str,
+        parse_ui_opts: impl FnOnce(UiConfig) -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
         use std::{env, fs};
 
         let dirs = BaseDirs::new()
@@ -181,11 +194,26 @@ impl Config {
             .as_deref()
             .ok_or_else(|| Error::Message("Missing configuration path".into()))?;
         let src = fs::read_to_string(config_file)?;
-        Self::evaluate(&src, info)
+        Self::evaluate(&src, info, ui_id, parse_ui_opts)
     }
 
-    /// Evaluates configuration text with the supplied complete client information.
-    pub fn evaluate(src: &str, info: HostInfo) -> Result<Self, Error> {
+    /// Evaluates source and parses its selected UI-specific dictionary.
+    ///
+    /// Validates every `ui_opts` entry before selecting the exact `use_ui_opts`
+    /// key, or `ui_id` when the selector is nil. A missing entry produces an empty
+    /// dictionary. Option dictionaries are never merged. The parser runs after
+    /// all core validation and receives only the selected dictionary.
+    ///
+    /// Returns evaluation, common-validation, and frontend schema errors
+    /// directly. Use [`Self::load()`] for file loading with complete-default
+    /// fallback and startup diagnostics.
+    pub fn evaluate<T>(
+        src: &str,
+        info: HostInfo,
+        ui_id: &str,
+        parse_ui_opts: impl FnOnce(UiConfig) -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
+        ui_opts::validate_id(ui_id)?;
         let info = info.resolved()?;
         let lua = Lua::new();
         let file = info
@@ -210,7 +238,14 @@ impl Config {
         let t: Table = lua.load(src).set_name(file.to_string_lossy()).eval()?;
         fields(
             &t,
-            &["clipboard", "default_host", "hosts", "ssh", "fonts"],
+            &[
+                "clipboard",
+                "default_host",
+                "hosts",
+                "ssh",
+                "ui_opts",
+                "use_ui_opts",
+            ],
             "configuration",
         )?;
         let mut diagnostics = Vec::new();
@@ -274,7 +309,6 @@ impl Config {
                 );
             }
         }
-        let fonts = parse_fonts(t.get("fonts")?)?;
         let (_ssh_config, _known_hosts) = {
             let ssh: Option<Table> = t.get("ssh")?;
             if let Some(s) = &ssh {
@@ -293,20 +327,24 @@ impl Config {
                     .unwrap_or_else(|| info.home_dir.join(".ssh/known_hosts")),
             )
         };
-        Ok(Self {
-            lua,
-            hosts,
-            default_spec: Host::default(),
-            client: Some(info),
-            default_host,
-            fonts,
-            clipboard,
-            diagnostics,
-            #[cfg(feature = "ssh")]
-            ssh_config: _ssh_config,
-            #[cfg(feature = "ssh")]
-            known_hosts: _known_hosts,
-        })
+        let opts = parse_ui_opts(ui_opts::select(&t, ui_id)?)
+            .map_err(|e| Error::UiOptions(Box::new(e)))?;
+        Ok((
+            Self {
+                lua,
+                hosts,
+                default_spec: Host::default(),
+                client: Some(info),
+                default_host,
+                clipboard,
+                diagnostics,
+                #[cfg(feature = "ssh")]
+                ssh_config: _ssh_config,
+                #[cfg(feature = "ssh")]
+                known_hosts: _known_hosts,
+            },
+            opts,
+        ))
     }
 
     /// Borrows the client information acquired before configuration execution.
@@ -342,10 +380,6 @@ impl Config {
             None if self.hosts.is_empty() => Some(HostSelection::Default),
             None => None,
         }
-    }
-    /// Returns the ordered font configuration.
-    pub fn fonts(&self) -> &[Font] {
-        &self.fonts
     }
 }
 
@@ -384,71 +418,6 @@ fn fields(t: &Table, accepted: &[&str], context: &str) -> Result<(), Error> {
         }
     }
     Ok(())
-}
-
-fn parse_fonts(value: Value) -> Result<Vec<Font>, Error> {
-    fn font(value: Value) -> Result<Font, Error> {
-        match value {
-            Value::String(family) => Ok(Font {
-                family: family.to_str()?.to_string(),
-                size: 12,
-            }),
-            Value::Table(t) => {
-                fields(&t, &["family", "size"], "font")?;
-                let Value::String(family) = t.get::<Value>("family")? else {
-                    return Err(Error::Message("font.family must be a string".into()));
-                };
-                let size = match t.get::<Value>("size")? {
-                    Value::Nil => 12,
-                    Value::Integer(n) => n,
-                    _ => return Err(Error::Message("font.size must have integer type".into())),
-                };
-                Ok(Font {
-                    family: family.to_str()?.to_string(),
-                    size,
-                })
-            }
-            _ => Err(Error::Message(
-                "fonts must be a string, font table, or font sequence".into(),
-            )),
-        }
-    }
-    match value {
-        Value::Nil => Ok(vec![Font {
-            family: "monospace".into(),
-            size: 12,
-        }]),
-        Value::String(_) => Ok(vec![font(value)?]),
-        Value::Table(t) if t.contains_key("family")? || t.contains_key("size")? => {
-            Ok(vec![font(Value::Table(t))?])
-        }
-        Value::Table(t) => {
-            let len = t.raw_len();
-            for pair in t.clone().pairs::<Value, Value>() {
-                let (key, _) = pair?;
-                if !matches!(key, Value::Integer(n) if n >= 1 && usize::try_from(n).is_ok_and(|n| n <= len))
-                {
-                    return Err(Error::Message(
-                        "fonts must be a contiguous font sequence".into(),
-                    ));
-                }
-            }
-            let mut ret = Vec::with_capacity(len);
-            for idx in 1..=len {
-                let value = t.raw_get::<Value>(idx)?;
-                if !matches!(value, Value::Table(_)) {
-                    return Err(Error::Message(
-                        "A font sequence must contain font tables".into(),
-                    ));
-                }
-                ret.push(font(value)?);
-            }
-            Ok(ret)
-        }
-        _ => Err(Error::Message(
-            "fonts must be a string, font table, or font sequence".into(),
-        )),
-    }
 }
 
 fn global_path(t: &Table, field: &str) -> Result<Option<PathBuf>, Error> {

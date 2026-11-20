@@ -373,7 +373,7 @@ impl Clipboard {
 
     /// Copies the supplied text without changing line endings or trailing LF.
     ///
-    /// Rejects NUL and byte order marks under the plugin string contract.
+    /// Rejects leading U+FEFF and NUL anywhere under the plugin string contract.
     /// Completion waits for the backend to acquire or store the supplied text.
     pub async fn copy(&self, text: String, register: &str) -> Result<(), String> {
         validate_text(&text)?;
@@ -431,8 +431,8 @@ impl Clipboard {
     /// Reads unmodified UTF-8 text from the selected clipboard backend.
     ///
     /// Preserves all line endings and trailing LF. Native GUI paste text is
-    /// independent of the plugin string contract and may contain NUL or byte
-    /// order marks.
+    /// independent of the plugin string contract and may contain leading U+FEFF
+    /// or NUL.
     /// Utility I/O is bounded by the configured operation timeout.
     pub async fn read(&self, register: &str) -> Result<String, String> {
         let slot = self.slot(register)?;
@@ -518,8 +518,8 @@ impl Clipboard {
 }
 
 fn validate_text(text: &str) -> Result<(), String> {
-    if text.contains(['\0', '\u{feff}']) {
-        Err("Clipboard text contains NUL or a byte order mark".into())
+    if text.starts_with('\u{feff}') || text.contains('\0') {
+        Err("Clipboard text begins with U+FEFF or contains NUL".into())
     } else {
         Ok(())
     }
@@ -721,6 +721,8 @@ mod tests {
                 "one line\n",
                 "日本語🙂\nliteral<Esc>",
                 "日本語🙂\nliteral<Esc>\n\n",
+                "before\u{feff}after",
+                "trailing\u{feff}",
             ] {
                 clipboard.copy(text.to_owned(), register).await.unwrap();
                 assert_eq!(
@@ -739,6 +741,7 @@ mod tests {
             "external\ntext",
             "external\r\ntext\n",
             "before\0after",
+            "\u{feff}before",
             "before\u{feff}after",
         ] {
             fs::write(&contents, text).unwrap();
@@ -802,10 +805,10 @@ mod tests {
             program,
             Duration::from_secs(1),
         );
-        for text in ["before\0after", "before\u{feff}after"] {
+        for text in ["before\0after", "\u{feff}after"] {
             assert_eq!(
                 clipboard.copy(text.into(), "+").await,
-                Err("Clipboard text contains NUL or a byte order mark".into())
+                Err("Clipboard text begins with U+FEFF or contains NUL".into())
             );
         }
         for register in ["", "invalid", "+\0", "*\u{feff}"] {
@@ -914,12 +917,14 @@ mod tests {
             "read".into(),
             Duration::from_secs(1),
         ));
-        assert_eq!(
-            clipboard.copy_later("invalid\0text".into(), "+".into(), |_| panic!(
-                "Unexpected error callback"
-            )),
-            Err("Clipboard text contains NUL or a byte order mark".into())
-        );
+        for text in ["invalid\0text", "\u{feff}invalid"] {
+            assert_eq!(
+                clipboard.copy_later(text.into(), "+".into(), |_| panic!(
+                    "Unexpected error callback"
+                )),
+                Err("Clipboard text begins with U+FEFF or contains NUL".into())
+            );
+        }
         assert_eq!(
             clipboard.copy_later("text".into(), "invalid".into(), |_| panic!(
                 "Unexpected error callback"
@@ -956,7 +961,7 @@ mod tests {
             Duration::from_secs(1),
         ));
         let (errors, mut messages) = mpsc::unbounded_channel();
-        for text in ["first\n", "second\n\n"] {
+        for text in ["first\u{feff}\n", "second\u{feff}\n\n\u{feff}"] {
             let errors = errors.clone();
             clipboard
                 .copy_later(text.to_owned(), "+".into(), move |e| {
@@ -968,7 +973,10 @@ mod tests {
         timeout(Duration::from_secs(2), clipboard.tasks.wait())
             .await
             .unwrap();
-        assert_eq!(clipboard.read("+").await.unwrap(), "second\n\n");
+        assert_eq!(
+            clipboard.read("+").await.unwrap(),
+            "second\u{feff}\n\n\u{feff}"
+        );
         assert!(messages.try_recv().is_err());
         clipboard.shutdown().await.unwrap();
     }

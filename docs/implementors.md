@@ -17,6 +17,7 @@ the rendering model and input types re-exported by `nauvim-core`.
 - [Responsibilities and lifetimes](#responsibilities-and-lifetimes)
 - [Runtime and event-loop integration](#runtime-and-event-loop-integration)
 - [Startup and host selection](#startup-and-host-selection)
+- [UI-specific configuration](#ui-specific-configuration)
 - [Engine events and session transitions](#engine-events-and-session-transitions)
 - [Rendering frames](#rendering-frames)
 - [Keyboard, mouse, and focus](#keyboard-mouse-and-focus)
@@ -35,7 +36,7 @@ environment as the client; an SSH host is remote.
 | --- | --- |
 | `Engine` | Configuration, owned-session discovery and startup, UI attachment, RPC transport, SSH, plugin argument validation, and client resource cleanup. |
 | Your `Backend` implementation | Presentation of Neovim frame state and ordered frame events through your renderer. |
-| Your application | Toolkit event loop, welcome page, host-selection controls, keyboard and GUI actions, fonts, GUI windows and tabs, error display, and process exit. |
+| Your application | UI implementation ID and option schema, toolkit event loop, welcome page, host-selection controls, keyboard and GUI actions, fonts, GUI windows and tabs, error display, and process exit. |
 | Host `nauvim-plugin` | Host-side Lua entry points and clipboard-provider callbacks. Core registers and selects its RPC destination during attachment. |
 
 `Engine::new()` does not take a backend. On `EngineEvent::Frame`, your
@@ -68,7 +69,7 @@ example, with the crate's default features:
 
 ```toml
 [dependencies]
-nauvim-core = "0.1"
+nauvim-core = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 ```
 
@@ -112,13 +113,16 @@ shutdown before treating the engine as finalized.
 
 ## Startup and host selection
 
-Load configuration with `Config::load(None)`, or supply an explicit path. It
-evaluates Lua in the client environment and falls back to the complete default
-configuration on loading or validation failure. The engine emits the retained
-diagnostics as client error events. An invalid clipboard timeout is a narrower
-fallback: it retains the rest of the configuration and uses the default timeout.
-See [loading configuration](usage.md#loading-configuration) and
-[clipboard settings](usage.md#clipboard).
+Load configuration with `Config::load()`, supplying an optional path, your UI
+implementation ID, and a parser for the selected UI-option dictionary. It
+returns the core configuration and the parser's result separately. See
+[UI-specific configuration](#ui-specific-configuration) for this interface.
+
+Loading or validation failure selects the complete default configuration. The
+engine emits retained diagnostics as client error events. An invalid clipboard
+timeout is a narrower fallback: it retains the rest of the configuration and
+uses the default timeout. See [loading configuration](usage.md#loading-configuration)
+and [clipboard settings](usage.md#clipboard).
 
 Create the engine, measure the editor viewport in cells, and call
 `Engine::start(width, height)`. Both dimensions must be positive.
@@ -151,6 +155,68 @@ return an error and queue `Welcome { error: Some(...) }`. Choose one display pat
 for that diagnostic. Also handle the returned result: errors such as failing
 to install the startup signal handler can occur before a welcome event is
 queued.
+
+## UI-specific configuration
+
+Choose and document a stable UI implementation ID for your application, together
+with its option schema: field names, types, meanings, and defaults. The ID
+identifies the implementation across launches. Reverse domain name notation,
+such as `org.example.nauvim.gui`, is recommended. It must be non-empty valid
+UTF-8, must not begin with U+FEFF, and must not contain NUL. Core rejects an
+invalid supplied ID before reading or executing configuration.
+
+`Config::load()` passes an owned `UiConfig` containing the selected dictionary to
+your parser after common configuration validation. It contains pure Rust data
+and can outlive the core configuration and engine. Parse it into your
+application's settings and return schema failures as `nauvim_core::Error`. Core
+returns `(Config, T)`, where `T` is your parser's result type. Use `Ok` as the
+parser to receive `UiConfig` directly. See
+[UI-specific settings](usage.md#ui-specific-configuration) for mapping validation
+and exact selection rules.
+
+Read root fields with `UiConfig::get()`. Values use `UiValue`; strings retain
+their original bytes. Nested tables use references resolved by
+`UiConfig::table()`, preserving shared and cyclic tables and arbitrary nested
+keys. `UiTable::entries()` exposes their key-value pairs. Non-data objects are
+represented by opaque identity tokens.
+
+The following partial example defines an illustrative schema with one optional
+positive integer field. It runs before engine construction:
+
+```rust
+use nauvim_core::{Config, Engine, Error, UiConfig, UiValue};
+
+struct GuiOptions {
+    font_size: i64,
+}
+
+fn parse_ui_opts(opts: UiConfig) -> Result<GuiOptions, Error> {
+    let font_size = match opts.get("font_size") {
+        None => 12,
+        Some(UiValue::Integer(n)) if *n > 0 => *n,
+        _ => return Err(Error::Message("font_size must be a positive integer".into())),
+    };
+
+    Ok(GuiOptions { font_size })
+}
+
+fn create_engine() -> Result<(Engine, GuiOptions), Error> {
+    let (config, opts) = Config::load(None, "org.example.nauvim.gui", parse_ui_opts)?;
+    Ok((Engine::new(config)?, opts))
+}
+```
+
+The parser runs only for the selected dictionary. Common validation also checks
+unselected dictionaries, but their fields are not interpreted against your
+schema. UI options remain distinct from Neovim UI attachment options.
+
+If reading, evaluation, common validation, or your parser fails, `Config::load()`
+discards the configuration and invokes your parser with an empty dictionary.
+It returns complete core defaults, your parsed UI defaults, and the original
+error in `Config::diagnostics()`. Your parser must accept an empty dictionary to
+construct those defaults. If it rejects that dictionary, loading returns an
+error. `Config::evaluate()` accepts the same ID and parser interface but returns
+evaluation or schema errors directly, without the file-loading fallback.
 
 ## Engine events and session transitions
 
@@ -269,9 +335,10 @@ objects. The [UI protocol][ui-protocol] defines the underlying event semantics.
 
 Apply highlight attributes and resolve absent colours through
 `State::default_colors`. When the model leaves a default colour unset, choose
-the frontend's default. Font discovery, fallback, shaping, metrics, and rendering
-belong to the application. `Config::fonts()` provides the ordered configured
-families and sizes; core supplies no font-search or font-diagnostic service.
+the frontend's default. Font configuration is part of your
+[UI-specific schema](#ui-specific-configuration). Font discovery, fallback,
+shaping, metrics, and rendering belong to the application; core supplies no
+font-search or font-diagnostic service.
 Font or display-scale changes require updating cell metrics, layout, and the
 requested UI dimensions.
 

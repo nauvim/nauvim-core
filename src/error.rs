@@ -31,6 +31,13 @@ pub enum Error {
     #[cfg(feature = "ssh")]
     Sftp(SftpError),
     Utf8(FromUtf8Error),
+    /// The frontend rejected the selected UI-specific options.
+    UiOptions(Box<Error>),
+    /// Configuration loading failed and the frontend also rejected its defaults.
+    DefaultUiOptions {
+        configuration: Box<Error>,
+        defaults: Box<Error>,
+    },
     Message(String),
     Timeout(&'static str),
 }
@@ -51,6 +58,14 @@ impl fmt::Display for Error {
             #[cfg(feature = "ssh")]
             Self::Sftp(e) => e.fmt(f),
             Self::Utf8(e) => e.fmt(f),
+            Self::UiOptions(e) => write!(f, "Parse UI options: {e}"),
+            Self::DefaultUiOptions {
+                configuration,
+                defaults,
+            } => write!(
+                f,
+                "Parse default UI options after configuration failure ({configuration}): {defaults}"
+            ),
             Self::Message(s) => f.write_str(s),
             Self::Timeout(s) => write!(f, "{s} timed out"),
         }

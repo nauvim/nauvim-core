@@ -20,7 +20,8 @@
 //!
 //! # use nauvim_core::Error;
 //! # async fn example() -> Result<(), Error> {
-//! let mut engine = Engine::new(Config::load(None)?)?;
+//! let (config, ()) = Config::load(None, "org.example.nauvim.events", |_opts| Ok(()))?;
+//! let mut engine = Engine::new(config)?;
 //! engine.start(100, 30).await?;
 //!
 //! loop {
@@ -40,7 +41,10 @@
 //! ```
 
 mod config;
-pub use config::{ClipboardConfig, Config, Font, HostInfo, HostSelection, Policies, ProjectDirs};
+pub use config::{
+    ClipboardConfig, Config, HostInfo, HostSelection, Policies, ProjectDirs, UiConfig, UiObjectId,
+    UiTable, UiTableId, UiValue,
+};
 mod connection;
 mod engine;
 pub use engine::{Client, Engine, EngineEvent, WebviewPosition};

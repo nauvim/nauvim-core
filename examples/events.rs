@@ -2,7 +2,8 @@ use nauvim_core::{Config, Engine, EngineEvent, Error};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let mut engine = Engine::new(Config::load(None)?)?;
+    let (config, ()) = Config::load(None, "org.example.nauvim.events", |_opts| Ok(()))?;
+    let mut engine = Engine::new(config)?;
     engine.start(100, 30).await?;
 
     loop {

@@ -328,8 +328,17 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Handler<W> for Dispatch {
 }
 
 fn wire_error(s: String) -> String {
-    if s.contains(['\0', '\u{feff}']) {
-        s.replace(['\0', '\u{feff}'], "\u{fffd}")
+    if s.starts_with('\u{feff}') || s.contains('\0') {
+        s.chars()
+            .enumerate()
+            .map(|(idx, c)| {
+                if c == '\0' || idx == 0 && c == '\u{feff}' {
+                    '\u{fffd}'
+                } else {
+                    c
+                }
+            })
+            .collect()
     } else if s.is_empty() {
         "Nauvim request failed".into()
     } else {
@@ -347,8 +356,8 @@ fn validate_params(params: &Array) -> Result<(), String> {
         match value {
             Object::Str(s) | Object::Bin(s) => {
                 let s = s.as_str().map_err(|_| "RPC strings must be valid UTF-8")?;
-                if s.contains(['\0', '\u{feff}']) {
-                    return Err("RPC strings must not contain NUL or byte order marks".into());
+                if s.starts_with('\u{feff}') || s.contains('\0') {
+                    return Err("RPC strings must not begin with U+FEFF or contain NUL".into());
                 }
             }
             Object::Array(values) => {

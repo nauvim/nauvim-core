@@ -88,8 +88,8 @@ pub(super) fn descendant(base: &Path, path: &Path) -> io::Result<PathBuf> {
 }
 
 pub(super) fn valid_string(value: &str) -> Result<(), String> {
-    if value.contains(['\0', '\u{feff}']) {
-        Err("Plugin strings must not contain NUL or a byte order mark".to_owned())
+    if value.starts_with('\u{feff}') || value.contains('\0') {
+        Err("Plugin strings must not begin with U+FEFF or contain NUL".to_owned())
     } else {
         Ok(())
     }
@@ -102,6 +102,20 @@ mod tests {
     use tempfile::tempdir;
 
     use std::os::unix::fs::symlink;
+
+    #[test]
+    fn validates_leading_feff_and_nul_without_restricting_interior_feff() {
+        for value in ["", "ordinary", "a\u{feff}b", "a\u{feff}", "/\u{feff}file"] {
+            assert_eq!(valid_string(value), Ok(()), "{value:?}");
+        }
+        for value in ["\u{feff}", "\u{feff}file", "\0", "a\0b", "a\u{feff}\0"] {
+            assert_eq!(
+                valid_string(value),
+                Err("Plugin strings must not begin with U+FEFF or contain NUL".into()),
+                "{value:?}"
+            );
+        }
+    }
 
     #[test]
     fn resolves_links_before_parent_components_and_missing_suffixes() {
