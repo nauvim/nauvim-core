@@ -16,6 +16,12 @@ ordinary editor operation.
 This implementation targets `nauvim-spec` commit
 [`e65f68cba1fb5c42996ba0370f5a1b86537b6142`](https://github.com/nauvim/nauvim-spec/tree/e65f68cba1fb5c42996ba0370f5a1b86537b6142).
 
+When the referenced `nauvim-spec` commit hash changes, `nauvim-core` increases its
+minor or major version. When the hash stays the same, it increases its patch
+version. Breaking changes or other release requirements may require exceptions
+to these rules. In all cases, releases with the same minor version are guaranteed
+to reference the same `nauvim-spec` commit hash.
+
 Build with Cargo and a C compiler. Lua 5.4 is bundled with the crate.
 
 The following console example prints errors and exits on the welcome or shutdown
