@@ -42,7 +42,9 @@ fn config(root: &Path, socket: &Path) -> Config {
     );
     let path = root.join("config.lua");
     fs::write(&path, src).unwrap();
-    Config::load(Some(&path)).unwrap()
+    let (config, ()) =
+        Config::load(Some(&path), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
+    config
 }
 
 async fn lua_bool(client: &Client, src: &str) -> bool {
@@ -130,7 +132,8 @@ async fn sigterm_removes_process_temporary_directory_before_shutdown_event() {
     if let Some(marker) = env::var_os(MARKER) {
         let file = Path::new(&marker).with_extension("lua");
         fs::write(&file, "return {hosts={choose={}}}").unwrap();
-        let config = Config::load(Some(&file)).unwrap();
+        let (config, ()) =
+            Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
         let mut engine = Engine::new(config).unwrap();
         engine.start(80, 24).await.unwrap();
         let temp = engine.temp_dir().to_path_buf();
@@ -219,7 +222,7 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
         local info = vim.api.nvim_get_chan_info(ui.chan).client
         local version = info.version
         return info.name == "nauvim-client-{}" and info.type == "ui"
-            and version.major == 0 and version.minor == 1 and version.patch == 0
+            and version.major == 0 and version.minor == 2 and version.patch == 0
             and vim.tbl_count(info.methods) == 0
             and vim.tbl_count(info.attributes) == 1
             and info.attributes.license == "MIT OR Apache-2.0"
@@ -402,7 +405,13 @@ async fn live_host_functions_receive_host_role_information() {
         lua_string(&bin),
         lua_string(socket.to_str().unwrap())
     );
-    let config = Config::evaluate(&src, HostInfo::local(Some(&file)).unwrap()).unwrap();
+    let (config, ()) = Config::evaluate(
+        &src,
+        HostInfo::local(Some(&file)).unwrap(),
+        "org.example.nauvim.session-test",
+        |_| Ok(()),
+    )
+    .unwrap();
     let mut engine = Engine::new(config).unwrap();
     engine.connect("local_host", 50, 12).await.unwrap();
     assert!(pid(&engine.client().unwrap()).await > 0);
@@ -600,7 +609,9 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
         lua_string(socket.to_str().unwrap())
     );
     fs::write(&file, src).unwrap();
-    let mut engine = Engine::new(Config::load(Some(&file)).unwrap()).unwrap();
+    let (config, ()) =
+        Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
+    let mut engine = Engine::new(config).unwrap();
     engine.connect("local_host", 80, 24).await.unwrap();
     let client = engine.client().unwrap();
     let value = client

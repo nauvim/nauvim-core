@@ -14,7 +14,7 @@ provides its renderer and GUI windows; the separate Lua plugin is optional for
 ordinary editor operation.
 
 This implementation targets `nauvim-spec` commit
-[`e65f68cba1fb5c42996ba0370f5a1b86537b6142`](https://github.com/nauvim/nauvim-spec/tree/e65f68cba1fb5c42996ba0370f5a1b86537b6142).
+[`8e23c1cd5705cc4f06e8a0acbb567ab27c3bb0f3`](https://github.com/nauvim/nauvim-spec/tree/8e23c1cd5705cc4f06e8a0acbb567ab27c3bb0f3).
 
 When the referenced `nauvim-spec` commit hash changes, `nauvim-core` increases its
 minor or major version. When the hash stays the same, it increases its patch
@@ -35,7 +35,8 @@ use nauvim_core::{Config, Engine, EngineEvent, Error};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let mut engine = Engine::new(Config::load(None)?)?;
+    let (config, ()) = Config::load(None, "org.example.nauvim.events", |_opts| Ok(()))?;
+    let mut engine = Engine::new(config)?;
     engine.start(100, 30).await?;
 
     loop {
@@ -58,6 +59,10 @@ async fn main() -> Result<(), Error> {
     engine.shutdown().await
 }
 ```
+
+The console example ignores the selected UI options. A GUI frontend supplies its
+documented implementation ID and parses the selected UI options in the callback;
+see [UI-specific configuration](docs/implementors.md#ui-specific-configuration).
 
 Use a Tokio runtime for engine operations. Call `shutdown()` when the last GUI
 window closes. SIGTERM is handled while connecting or receiving events, and

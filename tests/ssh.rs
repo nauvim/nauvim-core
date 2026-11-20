@@ -193,7 +193,9 @@ return {{
         );
         let file = self.root.path().join("config.lua");
         fs::write(&file, src).unwrap();
-        Config::load(Some(&file)).unwrap()
+        let (config, ()) =
+            Config::load(Some(&file), "org.example.nauvim.ssh-test", |_| Ok(())).unwrap();
+        config
     }
 
     async fn stop(mut self) {

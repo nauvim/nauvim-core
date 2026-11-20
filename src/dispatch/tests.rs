@@ -224,19 +224,19 @@ async fn validates_copy_notification_arguments_before_backend_access() {
         (arguments((7, "+", "text", true)), "Too many RPC arguments"),
         (
             arguments((7, "+", "a\0b")),
-            "RPC strings must not contain NUL or byte order marks",
+            "RPC strings must not begin with U+FEFF or contain NUL",
         ),
         (
-            arguments((7, "+", "a\u{feff}b")),
-            "RPC strings must not contain NUL or byte order marks",
+            arguments((7, "+", "\u{feff}b")),
+            "RPC strings must not begin with U+FEFF or contain NUL",
         ),
         (
             arguments((7, "+", &b"a\0b"[..])),
-            "RPC strings must not contain NUL or byte order marks",
+            "RPC strings must not begin with U+FEFF or contain NUL",
         ),
         (
-            arguments((7, "+", &b"a\xef\xbb\xbfb"[..])),
-            "RPC strings must not contain NUL or byte order marks",
+            arguments((7, "+", &b"\xef\xbb\xbfb"[..])),
+            "RPC strings must not begin with U+FEFF or contain NUL",
         ),
         (
             arguments((7, "+", &b"\xff"[..])),
@@ -689,11 +689,14 @@ async fn rejects_invalid_strings_at_every_nesting_level_after_client_id() {
         &b"\x92\x07\xc4\x03\xef\xbb\xbf"[..],
         &b"\x92\x07\xc4\x01\xff"[..],
         &b"\x92\x07\x91\xa2x\0"[..],
+        &b"\x92\x07\x91\xa3\xef\xbb\xbf"[..],
         &b"\x92\x07\x91\xc4\x02x\0"[..],
         &b"\x92\x07\x81\xa3\xef\xbb\xbf\xc0"[..],
         &b"\x92\x07\x81\xc4\x03\xef\xbb\xbf\xc0"[..],
         &b"\x92\x07\x81\xa1x\xa1\0"[..],
         &b"\x92\x07\x81\xa1x\xc4\x01\0"[..],
+        &b"\x92\x07\x81\xa1x\xa3\xef\xbb\xbf"[..],
+        &b"\x92\x07\x81\xa1x\x91\xa1\xff"[..],
     ] {
         let error = dispatch
             .request(b"nauvim-plugin/unknown", params(input))
@@ -716,9 +719,46 @@ async fn rejects_invalid_strings_at_every_nesting_level_after_client_id() {
     assert!(events.try_recv().is_err());
 }
 
+#[tokio::test]
+async fn permits_interior_and_trailing_feff_at_every_nesting_level() {
+    let (dispatch, mut events, _dir) = dispatch(7);
+    for input in [
+        &b"\x92\x07\xa5x\xef\xbb\xbfy"[..],
+        &b"\x92\x07\xa4x\xef\xbb\xbf"[..],
+        &b"\x92\x07\xc4\x04x\xef\xbb\xbf"[..],
+        &b"\x92\x07\x91\xa4x\xef\xbb\xbf"[..],
+        &b"\x92\x07\x91\xc4\x04x\xef\xbb\xbf"[..],
+        &b"\x92\x07\x81\xa4x\xef\xbb\xbf\xc0"[..],
+        &b"\x92\x07\x81\xc4\x04x\xef\xbb\xbf\xc0"[..],
+        &b"\x92\x07\x81\xa1x\x81\xa1y\xa4z\xef\xbb\xbf"[..],
+    ] {
+        let error = dispatch
+            .request(b"nauvim-plugin/unknown", params(input))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "Unknown or disabled Nauvim request", "{input:?}");
+        dispatch
+            .notification(b"nauvim-plugin/unknown", params(input))
+            .await
+            .unwrap();
+    }
+    assert!(events.try_recv().is_err());
+}
+
 #[test]
 fn keeps_wire_errors_nonempty_and_free_of_forbidden_characters() {
     assert_eq!(wire_error(String::new()), "Nauvim request failed");
-    assert_eq!(wire_error("a\0b\u{feff}".into()), "a\u{fffd}b\u{fffd}");
+    assert_eq!(wire_error("a\0b\u{feff}".into()), "a\u{fffd}b\u{feff}");
     assert_eq!(wire_error("ordinary failure".into()), "ordinary failure");
+    assert_eq!(wire_error("\u{feff}failure".into()), "\u{fffd}failure");
+    assert_eq!(
+        wire_error("\u{feff}\u{feff}\0".into()),
+        "\u{fffd}\u{feff}\u{fffd}"
+    );
+    assert_eq!(
+        wire_error("failure\u{feff}text".into()),
+        "failure\u{feff}text"
+    );
+    assert_eq!(wire_error("failure\u{feff}".into()), "failure\u{feff}");
 }

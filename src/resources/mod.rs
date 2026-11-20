@@ -467,7 +467,13 @@ mod tests {
                 base.join("preview/file")
             );
         }
-        for input in ["", "/", ".", "a/..", "../escape", "a\0b", "a\u{feff}b"] {
+        for input in ["a\u{feff}b", "a\u{feff}", "/\u{feff}file"] {
+            assert_eq!(
+                resources.client_path(input).unwrap(),
+                base.join(input.trim_start_matches('/'))
+            );
+        }
+        for input in ["", "/", ".", "a/..", "../escape", "a\0b", "\u{feff}b"] {
             assert!(resources.client_path(input).is_err(), "{input:?}");
         }
         for input in [

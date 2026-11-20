@@ -1048,6 +1048,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn emits_ui_schema_failure_after_resetting_configuration_to_defaults() {
+        use crate::{HostSelection, UiValue};
+
+        use tempfile::tempdir;
+
+        use std::fs::write;
+
+        let root = tempdir().unwrap();
+        let file = root.path().join("init.lua");
+        write(
+            &file,
+            "return {hosts={custom={}},ui_opts={test={size='invalid'}}}",
+        )
+        .unwrap();
+        let (config, size) = Config::load(Some(&file), "test", |opts| match opts.get("size") {
+            None => Ok(12),
+            Some(UiValue::Integer(n)) => Ok(*n),
+            _ => Err(Error::Message("size must be an integer".into())),
+        })
+        .unwrap();
+        assert_eq!(size, 12);
+        assert!(config.hosts().next().is_none());
+        assert_eq!(config.startup_host(), Some(HostSelection::Default));
+        let diagnostic = config.diagnostics().first().unwrap().clone();
+        assert!(diagnostic.contains("UI options"), "{diagnostic}");
+        let mut engine = Engine::new(config).unwrap();
+        let EngineEvent::Error(error) = engine.next_event().await else {
+            panic!("Expected the selected UI schema diagnostic");
+        };
+        assert_eq!(error, diagnostic);
+        engine.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn preserves_nonfatal_clipboard_diagnostics_across_connection_attempts() {
         use tempfile::tempdir;
 
@@ -1060,7 +1094,8 @@ mod tests {
             "return {clipboard={backend='missing-test-backend',timeout_ms=0}}",
         )
         .unwrap();
-        let config = Config::load(Some(&file)).unwrap();
+        let (config, ()) =
+            Config::load(Some(&file), "org.example.nauvim.engine-test", |_| Ok(())).unwrap();
         assert_eq!(config.diagnostics().len(), 1);
         let timeout_error = config.diagnostics().first().unwrap().clone();
         let mut engine = Engine::new(config).unwrap();

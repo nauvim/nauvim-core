@@ -45,7 +45,9 @@ impl Session {
         );
         let file = root.join("config.lua");
         fs::write(&file, src).unwrap();
-        let mut engine = Engine::new(Config::load(Some(&file)).unwrap()).unwrap();
+        let (config, ()) =
+            Config::load(Some(&file), "org.example.nauvim.clipboard-test", |_| Ok(())).unwrap();
+        let mut engine = Engine::new(config).unwrap();
         timeout(
             Duration::from_secs(20),
             engine.connect("local_host", 60, 16),
@@ -197,7 +199,14 @@ async fn isolated_notifications_validate_text_and_gui_paste_uses_native_input() 
         let mut session = Session::open(root).await;
 
         for (register, selection) in [("+", "clipboard"), ("*", "primary")] {
-            for text in ["", "日本語🙂", "first\nliteral<Esc>\n", "two\n\nlines"] {
+            for text in [
+                "",
+                "日本語🙂",
+                "first\nliteral<Esc>\n",
+                "two\n\nlines",
+                "before\u{feff}after",
+                "trailing\u{feff}",
+            ] {
                 session.copy(register, text).await;
                 assert_eq!(fs::read(root.join(selection)).unwrap(), text.as_bytes());
             }
@@ -213,7 +222,7 @@ async fn isolated_notifications_validate_text_and_gui_paste_uses_native_input() 
             format!("{id}, '+', {{'old lines shape'}}"),
             format!("{id}, '+', 'extra argument', false"),
             format!("{id}, '+', 'before'..string.char(0)..'after'"),
-            format!("{id}, '+', 'before'..string.char(239,187,191)..'after'"),
+            format!("{id}, '+', string.char(239,187,191)..'after'"),
             format!("{id}, '+', string.char(255)"),
         ] {
             session.notify(&arguments).await;
@@ -506,7 +515,9 @@ async fn unavailable_backend_reports_client_error_without_preventing_engine_crea
     let root = tempdir().unwrap();
     let file = root.path().join("init.lua");
     fs::write(&file, "return {clipboard='not-a-clipboard-backend'}").unwrap();
-    let mut engine = Engine::new(Config::load(Some(&file)).unwrap()).unwrap();
+    let (config, ()) =
+        Config::load(Some(&file), "org.example.nauvim.clipboard-test", |_| Ok(())).unwrap();
+    let mut engine = Engine::new(config).unwrap();
     let event = timeout(Duration::from_secs(1), engine.next_event())
         .await
         .unwrap();
@@ -526,7 +537,8 @@ async fn invalid_timeout_reports_client_error_and_uses_default() {
         "return {clipboard={backend='not-a-clipboard-backend',timeout_ms=3.0}}",
     )
     .unwrap();
-    let config = Config::load(Some(&file)).unwrap();
+    let (config, ()) =
+        Config::load(Some(&file), "org.example.nauvim.clipboard-test", |_| Ok(())).unwrap();
     assert_eq!(config.clipboard().timeout(), Duration::from_secs(3));
     let mut engine = Engine::new(config).unwrap();
     let event = timeout(Duration::from_secs(1), engine.next_event())
