@@ -1,18 +1,18 @@
 /// An owned snapshot of the selected UI-specific option dictionary.
 ///
-/// Tables form a graph so shared references, cycles, and table-valued keys are
-/// preserved. Strings retain their original bytes. Opaque values have local
-/// identity tokens; they retain no runtime resources or executable behavior.
+/// Nested dictionaries and lists can share table references. The snapshot
+/// owns its data independently of the Lua runtime.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UiConfig {
     pub(super) root: UiTable,
     pub(super) tables: Vec<UiTable>,
 }
 
-/// An owned table containing key-value pairs in unspecified order.
+/// An owned dictionary or list of UI option values.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct UiTable {
     pub(super) entries: Vec<(UiValue, UiValue)>,
+    pub(super) is_list: bool,
 }
 
 /// An owned UI-specific option value.
@@ -22,21 +22,15 @@ pub enum UiValue {
     Boolean(bool),
     Integer(i64),
     Number(f64),
-    /// Preserves string bytes without requiring UTF-8.
-    String(Vec<u8>),
+    /// Text without NUL or an initial U+FEFF.
+    String(String),
     /// Identifies another table in the same configuration snapshot.
     Table(UiTableId),
-    /// Identifies a non-data object without retaining its runtime resources.
-    Opaque(UiObjectId),
 }
 
 /// Identifies a table within one [`UiConfig`] snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UiTableId(pub(super) usize);
-
-/// Identifies an opaque object within one [`UiConfig`] snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct UiObjectId(pub(super) usize);
 
 impl UiConfig {
     /// Borrows the selected dictionary, whose keys are string values.
@@ -59,18 +53,22 @@ impl UiConfig {
 }
 
 impl UiTable {
-    /// Iterates over the table's key-value pairs in unspecified order.
+    /// Returns whether this table represents a non-empty ordered list.
+    /// Empty Lua tables are represented as dictionaries.
+    pub fn is_list(&self) -> bool {
+        self.is_list
+    }
+
+    /// Iterates over ordered list elements with their one-based integer keys,
+    /// or over dictionary entries with string keys in unspecified order.
     pub fn entries(&self) -> impl ExactSizeIterator<Item = (&UiValue, &UiValue)> {
         self.entries.iter().map(|(key, value)| (key, value))
     }
 
     /// Borrows a string-keyed value by its exact UTF-8 key.
-    ///
-    /// Use [`Self::entries()`] for byte-string keys that are not valid UTF-8 or
-    /// for keys of other types.
     pub fn get(&self, key: &str) -> Option<&UiValue> {
         self.entries.iter().find_map(|(candidate, value)| {
-            matches!(candidate, UiValue::String(bytes) if bytes == key.as_bytes()).then_some(value)
+            matches!(candidate, UiValue::String(text) if text == key).then_some(value)
         })
     }
 }

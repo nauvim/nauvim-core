@@ -302,6 +302,50 @@ fn validates_unused_native_ssh_tables_and_inline_jump_hosts() {
 }
 
 #[test]
+fn validates_typed_configuration_strings() {
+    for src in [
+        r"return {default_host='\239\187\191alias'}",
+        r"return {hosts={['al\0ias']={}}}",
+        r"return {hosts={a={nvim='\239\187\191nvim'}}}",
+        r"return {hosts={a={nvim={prog='nv\0im'}}}}",
+        r"return {hosts={a={nvim={args={'\255'}}}}}",
+        r"return {hosts={a={nvim={env={['\239\187\191name']='value'}}}}}",
+        r"return {hosts={a={nvim={env={NAME='val\0ue'}}}}}",
+        r"return {hosts={a={socket='so\0cket'}}}",
+        r"return {ssh={config='/ssh/con\0fig'}}",
+        r"return {hosts={a={ssh={host_name='\255'}}}}",
+        r"return {hosts={a={ssh={proxy_jump={{user='\239\187\191user'}}}}}}",
+        r"return {hosts={a={ssh={identity_file='/ssh/\0id'}}}}",
+        r"return {clipboard='au\0to'}",
+        r"return {clipboard={backend='\239\187\191auto'}}",
+    ] {
+        let error = evaluate(src).err().unwrap().to_string();
+        assert!(
+            error.contains("U+FEFF or contain NUL") || error.contains("valid UTF-8"),
+            "{src}: {error}"
+        );
+    }
+    assert!(evaluate(r"return {default_host='al\239\187\191ias',hosts={['al\239\187\191ias']={nvim={args={'', 'in\239\187\191terior'}},socket='in\239\187\191terior'}}}").is_ok());
+}
+
+#[test]
+fn validates_host_information_before_running_configuration() {
+    for field in ["host_name", "user"] {
+        let mut info = info(Path::new("/tmp/nauvim-tests/config.lua"));
+        match field {
+            "host_name" => info.host_name = "\u{feff}host".into(),
+            "user" => info.user = "us\0er".into(),
+            _ => unreachable!(),
+        }
+        let error = Config::evaluate("error('configuration ran')", info, UI_ID, Ok)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
 fn accepts_user_defined_host_aliases_with_punctuation() {
     let config = evaluate("return {hosts = {['prod-host*?!'] = {}}}").unwrap();
     assert_eq!(config.hosts().collect::<Vec<_>>(), ["prod-host*?!"]);
@@ -409,14 +453,14 @@ fn selects_exact_ui_key_without_merging_dictionaries() {
         assert_eq!(opts.root().entries().len(), 1, "{src}");
         assert_eq!(
             opts.get(key),
-            Some(&UiValue::String(expected.as_bytes().to_vec())),
+            Some(&UiValue::String(expected.into())),
             "{src}"
         );
     }
 }
 
 #[test]
-fn validates_all_ui_dictionaries_and_nested_function_keys_and_values() {
+fn validates_ui_values_in_unselected_dictionaries() {
     for invalid in [
         "false",
         "'string'",
@@ -428,6 +472,18 @@ fn validates_all_ui_dictionaries_and_nested_function_keys_and_values() {
         "{nested={[function() end]=true}}",
         "{nested={[{handler=function() end}]=true}}",
         "{nested={{{function() end}}}}",
+        "{nested=coroutine.create(function() end)}",
+        "{nested=io.stdout}",
+        "{nested={[false]=true}}",
+        "{nested={[1.5]=true}}",
+        "{nested={true,[3]=false}}",
+        "{nested={true,name=false}}",
+        r"{nested={['\255']=true}}",
+        r"{nested={['\239\187\191key']=true}}",
+        r"{nested={['key\0']=true}}",
+        r"{nested={'\255'}}",
+        r"{nested={'\239\187\191value'}}",
+        r"{nested={'value\0'}}",
     ] {
         let src = format!(
             "return {{ui_opts={{['org.example.nauvim.test']={{valid=true}},unused={invalid}}}}}"
@@ -495,47 +551,41 @@ fn validates_ui_mapping_keys_selectors_and_implementation_ids() {
 }
 
 #[test]
-fn preserves_opaque_ui_option_values_and_binary_string_keys() {
+fn delivers_nested_ui_lists_and_string_keyed_dictionaries() {
     let opts = ui_options(
         r#"return {
             ui_opts={['org.example.nauvim.test']={
                 ['kebab-key']=-3,
-                ['\255\0\239\187\191']='\239\187\191\0\255',
+                ['']='',
+                ['key\239\187\191end']='日本語\239\187\191',
                 ratio=12.5,
                 infinity=math.huge,
-                nested={[false]=-5,[2.5]='float key'},
-                fonts={arbitrary='frontend schema'},
+                fonts={[2]='Fallback', [1]={ family='Mono', size=16 }},
             }},
         }"#,
     )
     .unwrap();
     assert_eq!(opts.get("kebab-key"), Some(&UiValue::Integer(-3)));
-    let binary = opts
-        .root()
-        .entries()
-        .find(|(key, _)| matches!(key, UiValue::String(s) if s == b"\xff\0\xef\xbb\xbf"))
-        .unwrap()
-        .1;
-    assert_eq!(binary, &UiValue::String(b"\xef\xbb\xbf\0\xff".to_vec()));
+    assert_eq!(opts.get(""), Some(&UiValue::String("".into())));
+    assert_eq!(
+        opts.get("key\u{feff}end"),
+        Some(&UiValue::String("日本語\u{feff}".into()))
+    );
     assert_eq!(opts.get("ratio"), Some(&UiValue::Number(12.5)));
     assert_eq!(opts.get("infinity"), Some(&UiValue::Number(f64::INFINITY)));
-    let nested = opts.table(table_id(opts.get("nested"))).unwrap();
-    assert!(
-        nested
-            .entries()
-            .any(|(key, value)| key == &UiValue::Boolean(false) && value == &UiValue::Integer(-5))
-    );
-    assert!(
-        nested
-            .entries()
-            .any(|(key, value)| key == &UiValue::Number(2.5)
-                && value == &UiValue::String(b"float key".to_vec()))
-    );
+    assert!(!opts.root().is_list());
     let fonts = opts.table(table_id(opts.get("fonts"))).unwrap();
+    assert!(fonts.is_list());
+    let entries = fonts.entries().collect::<Vec<_>>();
+    assert_eq!(entries[0].0, &UiValue::Integer(1));
     assert_eq!(
-        fonts.get("arbitrary"),
-        Some(&UiValue::String(b"frontend schema".to_vec()))
+        entries[1],
+        (&UiValue::Integer(2), &UiValue::String("Fallback".into()))
     );
+    let font = opts.table(table_id(Some(entries[0].1))).unwrap();
+    assert!(!font.is_list());
+    assert_eq!(font.get("family"), Some(&UiValue::String("Mono".into())));
+    assert_eq!(font.get("size"), Some(&UiValue::Integer(16)));
 }
 
 fn table_id(value: Option<&UiValue>) -> UiTableId {
@@ -546,46 +596,28 @@ fn table_id(value: Option<&UiValue>) -> UiTableId {
 }
 
 #[test]
-fn validates_cyclic_and_shared_ui_tables_without_changing_identity() {
+fn keeps_shared_ui_tables_and_rejects_cycles() {
     let opts = ui_options(
         r#"
-        local shared={value=42}
-        local options={first=shared,second=shared}
-        options.self=options
-        shared[options]=shared
-        return {ui_opts={['org.example.nauvim.test']=options,unused=shared}}
-        "#,
-    );
-    // A table with non-string keys cannot itself be an option dictionary.
-    assert!(opts.is_err());
-    let opts = ui_options(
-        r#"
-        local shared={value=42}
-        local options={first=shared,second=shared}
-        options.self=options
-        shared[options]=shared
+        local child={value=42}
+        local shared={child=child}
+        local options={first=shared,second=shared,third=child}
         return {ui_opts={['org.example.nauvim.test']=options,unused={shared=shared}}}
         "#,
     )
     .unwrap();
-    let first = table_id(opts.get("first"));
-    let root = table_id(opts.get("self"));
     assert_eq!(opts.get("first"), opts.get("second"));
-    assert!(std::ptr::eq(opts.root(), opts.table(root).unwrap()));
-    let first_table = opts.table(first).unwrap();
-    assert_eq!(first_table.get("value"), Some(&UiValue::Integer(42)));
-    assert!(
-        first_table
-            .entries()
-            .any(|(key, value)| key == &UiValue::Table(root) && value == &UiValue::Table(first))
-    );
-    let src = r#"
-        local cycle={}
-        cycle.self=cycle
-        cycle.handler=function() end
-        return {ui_opts={unused=cycle}}
-    "#;
-    assert!(ui_options(src).is_err());
+    let shared = opts.table(table_id(opts.get("first"))).unwrap();
+    assert_eq!(shared.get("child"), opts.get("third"));
+    let child = opts.table(table_id(shared.get("child"))).unwrap();
+    assert_eq!(child.get("value"), Some(&UiValue::Integer(42)));
+
+    for src in [
+        "local t={}; t.self=t; return {ui_opts={unused=t}}",
+        "local a,b={},{}; a.b=b; b.a=a; return {ui_opts={unused={a=a,b=b}}}",
+    ] {
+        assert!(ui_options(src).is_err(), "{src}");
+    }
 }
 
 fn parse_size(opts: UiConfig) -> Result<i64, Error> {
@@ -693,7 +725,7 @@ fn passes_only_empty_defaults_to_parser_after_common_validation_failure() {
     assert_eq!(config.startup_host(), Some(HostSelection::Default));
     assert!(config.hosts().next().is_none());
     assert_eq!(config.diagnostics().len(), 1);
-    assert!(config.diagnostics()[0].contains("must not contain functions"));
+    assert!(config.diagnostics()[0].contains("Unsupported UI option value type: function"));
 }
 
 #[test]
@@ -725,6 +757,6 @@ fn owns_selected_ui_options_independently_of_core_configuration() {
     let nested = opts.table(table_id(opts.get("nested"))).unwrap();
     assert_eq!(
         nested.get("value"),
-        Some(&UiValue::String(b"retained".to_vec()))
+        Some(&UiValue::String("retained".into()))
     );
 }

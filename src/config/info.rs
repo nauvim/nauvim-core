@@ -1,5 +1,7 @@
 use crate::Error;
 
+use super::validate_string;
+
 use mlua::{Lua, Table};
 
 use std::collections::VecDeque;
@@ -72,26 +74,48 @@ impl HostInfo {
     }
 
     pub(crate) fn table(&self, lua: &Lua) -> Result<Table, Error> {
-        fn text(path: &Path) -> Result<&str, Error> {
-            path.to_str().ok_or_else(|| {
-                Error::Message(format!(
-                    "Host information path is not UTF-8: {}",
-                    path.display()
-                ))
-            })
+        fn text<'a>(path: &'a Path, field: &str) -> Result<&'a str, Error> {
+            let path = path
+                .to_str()
+                .ok_or_else(|| Error::Message(format!("{field} must be valid UTF-8")))?;
+            validate_string(path, field)?;
+            Ok(path)
         }
+        validate_string(&self.host_name, "HostInfo.host_name")?;
+        validate_string(&self.user, "HostInfo.user")?;
         let t = lua.create_table()?;
         t.set("host_name", self.host_name.as_str())?;
         t.set("user", self.user.as_str())?;
         t.set(
             "config_file",
-            self.config_file.as_ref().map(|p| text(p)).transpose()?,
+            self.config_file
+                .as_deref()
+                .map(|p| text(p, "HostInfo.config_file"))
+                .transpose()?,
         )?;
-        t.set("home_dir", text(&self.home_dir)?)?;
+        t.set("home_dir", text(&self.home_dir, "HostInfo.home_dir")?)?;
         let dirs = lua.create_table()?;
-        dirs.set("cache_dir", text(&self.project_dirs.cache_dir)?)?;
-        dirs.set("data_dir", text(&self.project_dirs.data_dir)?)?;
-        dirs.set("runtime_dir", text(&self.project_dirs.runtime_dir)?)?;
+        dirs.set(
+            "cache_dir",
+            text(
+                &self.project_dirs.cache_dir,
+                "HostInfo.project_dirs.cache_dir",
+            )?,
+        )?;
+        dirs.set(
+            "data_dir",
+            text(
+                &self.project_dirs.data_dir,
+                "HostInfo.project_dirs.data_dir",
+            )?,
+        )?;
+        dirs.set(
+            "runtime_dir",
+            text(
+                &self.project_dirs.runtime_dir,
+                "HostInfo.project_dirs.runtime_dir",
+            )?,
+        )?;
         t.set("project_dirs", dirs)?;
         Ok(t)
     }
@@ -107,6 +131,7 @@ fn output(prog: &str, args: &[&str]) -> Result<String, Error> {
         )));
     }
     let ret = String::from_utf8(out.stdout)?.trim().to_owned();
+    validate_string(&ret, "Host information")?;
     if ret.is_empty() {
         return Err(Error::Message(format!(
             "{prog} returned empty host information"

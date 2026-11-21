@@ -42,8 +42,8 @@
 
 mod config;
 pub use config::{
-    ClipboardConfig, Config, HostInfo, HostSelection, Policies, ProjectDirs, UiConfig, UiObjectId,
-    UiTable, UiTableId, UiValue,
+    ClipboardConfig, Config, HostInfo, HostSelection, Policies, ProjectDirs, UiConfig, UiTable,
+    UiTableId, UiValue,
 };
 mod connection;
 mod engine;
@@ -61,6 +61,10 @@ mod ssh;
 pub use nvim_rpc_ui::{Backend, Frame, GridId, KeyInput, Modifiers, SpecialKey, State, UiOptions};
 
 use std::fmt;
+
+fn is_spec_string(s: &str) -> bool {
+    !s.starts_with('\u{feff}') && !s.contains('\0')
+}
 
 /// Identifies one Nauvim process across attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

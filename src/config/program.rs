@@ -1,6 +1,6 @@
 use crate::Error;
 
-use super::HostInfo;
+use super::{HostInfo, lua_string};
 
 use mlua::{Function, Lua, Value};
 
@@ -68,7 +68,7 @@ impl ProgramSetting {
 
 fn string(value: Value, field: &str) -> Result<String, Error> {
     match value {
-        Value::String(value) => Ok(value.to_str()?.to_string()),
+        Value::String(value) => Ok(lua_string(&value, field)?.to_string()),
         _ => Err(Error::Message(format!("{field} must be a string"))),
     }
 }
@@ -112,9 +112,9 @@ fn environment(value: Value) -> Result<BTreeMap<String, String>, Error> {
     for pair in table.pairs::<Value, Value>() {
         let (key, value) = pair?;
         let key = string(key, "nvim.env name")?;
-        if key.is_empty() || key.contains(['=', '\0']) {
+        if key.is_empty() || key.contains('=') {
             return Err(Error::Message(
-                "nvim.env names must be nonempty and contain neither '=' nor NUL".into(),
+                "nvim.env names must be nonempty and must not contain '='".into(),
             ));
         }
         env.insert(key, string(value, "nvim.env value")?);
@@ -125,7 +125,7 @@ fn environment(value: Value) -> Result<BTreeMap<String, String>, Error> {
 fn program(value: Value) -> Result<Program, Error> {
     match value {
         Value::String(value) => Ok(Program {
-            prog: value.to_str()?.to_string(),
+            prog: lua_string(&value, "nvim")?.to_string(),
             args: Vec::new(),
             env: BTreeMap::new(),
         }),
@@ -264,6 +264,8 @@ mod tests {
         for src in [
             "return function(_) return 42 end",
             "return function(_) return {prog='nvim',args={},env={A=true}} end",
+            r"return function(_) return 'nv\0im' end",
+            r"return function(_) return {args={'\239\187\191argument'}} end",
         ] {
             assert!(
                 parse(&lua, src)

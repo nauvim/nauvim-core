@@ -174,11 +174,11 @@ parser to receive `UiConfig` directly. See
 [UI-specific settings](usage.md#ui-specific-configuration) for mapping validation
 and exact selection rules.
 
-Read root fields with `UiConfig::get()`. Values use `UiValue`; strings retain
-their original bytes. Nested tables use references resolved by
-`UiConfig::table()`, preserving shared and cyclic tables and arbitrary nested
-keys. `UiTable::entries()` exposes their key-value pairs. Non-data objects are
-represented by opaque identity tokens.
+Read root fields with `UiConfig::get()`. `UiValue::String` holds validated Rust
+text. Resolve a nested table reference with `UiConfig::table()`. Use
+`UiTable::is_list()` to identify non-empty lists. Their `entries()` yield
+one-based integer keys in order. Dictionary entries have string keys and
+iterate in unspecified order. An empty Lua table becomes an empty dictionary.
 
 The following partial example defines an illustrative schema with one optional
 positive integer field. It runs before engine construction:
@@ -540,9 +540,9 @@ document. HTTPS presentations must accept the self-signed certificates generated
 by core's file-serving interface. The event supplies a URL, not a certificate
 or trust-store API. Choose a component and certificate-handling integration that
 can meet that requirement. Other PKI behaviour is unspecified by the
-specification. The server supports HTTPS HTTP/1.1, HTTPS HTTP/2, and cleartext
-HTTP/2; use a presentation component compatible with the URLs your application
-offers.
+specification. File serving supports HTTP/1.1 with and without TLS and HTTP/2
+over TLS. Use a presentation component compatible with the URLs your
+application offers.
 
 ### Resource cleanup
 

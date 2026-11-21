@@ -1,6 +1,6 @@
 use crate::Error;
 
-use super::{Config, HostInfo};
+use super::{Config, HostInfo, lua_string};
 
 use mlua::{Table, Value};
 
@@ -82,7 +82,7 @@ fn message(s: impl Into<String>) -> Error {
 
 fn string(value: Value, field: &str) -> Result<String, Error> {
     match value {
-        Value::String(s) => Ok(s.to_str()?.to_string()),
+        Value::String(s) => Ok(lua_string(&s, &format!("SSH {field}"))?.to_string()),
         _ => Err(message(format!("SSH {field} must be a string"))),
     }
 }
@@ -136,7 +136,7 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
                 let port = match value {
                     Value::Integer(n) => u16::try_from(n).ok(),
                     Value::String(s) => {
-                        let s = s.to_str()?;
+                        let s = lua_string(&s, "SSH port")?;
                         if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
                             None
                         } else {
@@ -159,7 +159,7 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
                 settings.identities_only = Some(match value {
                     Value::Boolean(value) => value,
                     Value::String(value) => {
-                        let value = value.to_str()?;
+                        let value = lua_string(&value, "SSH identities_only")?;
                         if value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes") {
                             true
                         } else if value.eq_ignore_ascii_case("false")
@@ -182,7 +182,10 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
             "proxy_jump" => settings.jumps = Some(jumps(value)?),
             "kex_algorithms" | "host_key_algorithms" => {
                 let values = match value {
-                    Value::String(s) => s.to_str()?.split(',').map(str::to_owned).collect(),
+                    Value::String(s) => lua_string(&s, &field)?
+                        .split(',')
+                        .map(str::to_owned)
+                        .collect(),
                     Value::Table(table) => sequence(table, &field)?
                         .into_iter()
                         .map(|value| string(value, &field))
@@ -210,7 +213,7 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
 fn jumps(value: Value) -> Result<Vec<Jump>, Error> {
     fn jump(value: Value) -> Result<Jump, Error> {
         match value {
-            Value::String(s) => Ok(Jump::Alias(s.to_str()?.to_string())),
+            Value::String(s) => Ok(Jump::Alias(lua_string(&s, "SSH proxy_jump")?.to_string())),
             Value::Table(table) => Ok(Jump::Inline(table)),
             _ => Err(message(
                 "SSH proxy_jump must contain host aliases or inline SSH tables",
@@ -218,7 +221,7 @@ fn jumps(value: Value) -> Result<Vec<Jump>, Error> {
         }
     }
     match value {
-        Value::String(s) => Ok(vec![Jump::Alias(s.to_str()?.to_string())]),
+        Value::String(_) => Ok(vec![jump(value)?]),
         Value::Table(table) => {
             let mut has_named_field = false;
             for pair in table.clone().pairs::<Value, Value>() {
