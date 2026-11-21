@@ -41,9 +41,12 @@ NVIM_BIN=/absolute/path/to/nvim cargo test --all-features --test session -- --ig
 ```
 
 The SSH test provisions a temporary loopback `sshd`, host keys, an identity, an
-authorized-key file, and a known-hosts file. It requires `sshd`, `ssh-keygen`,
-`kill`, SFTP support, and an account permitted to authenticate to the test daemon.
-It does not use the user's SSH configuration or host-key trust file.
+authorized-key file, and a known-hosts file. It requires the OpenSSH server
+(`openssh-server` on Debian and Ubuntu), `ssh-keygen`, `kill`, SFTP support, and an
+account permitted to authenticate to the test daemon. The test searches `PATH`
+for `sshd` and falls back to `/usr/sbin/sshd`. Set `SSHD_BIN` to use a specific
+executable. The test does not use the user's SSH configuration or host-key trust
+file.
 
 ```sh
 NVIM_BIN=/absolute/path/to/nvim cargo test --all-features --test ssh -- --ignored

@@ -29,6 +29,41 @@ fn shell_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+fn sshd_bin() -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let configured = env::var_os("SSHD_BIN");
+    let name = configured
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(Path::new("sshd"));
+    let is_command = name.file_name() == Some(name.as_os_str());
+    let path = env::var_os("PATH").filter(|_| is_command);
+    let fallback = match configured {
+        None => Some(PathBuf::from("/usr/sbin/sshd")),
+        Some(_) if !is_command => Some(name.to_path_buf()),
+        Some(_) => None,
+    };
+    let bin = path
+        .iter()
+        .flat_map(env::split_paths)
+        .map(|dir| dir.join(name))
+        .chain(fallback)
+        .find(|path| {
+            fs::metadata(path)
+                .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "Cannot find executable {}. Install the OpenSSH server or set SSHD_BIN to its sshd executable.",
+                name.display()
+            )
+        });
+    // OpenSSH can re-exec itself and needs an absolute executable path.
+    std::path::absolute(&bin)
+        .unwrap_or_else(|err| panic!("Resolve sshd path {}: {err}", bin.display()))
+}
+
 struct Server {
     root: TempDir,
     daemon: Child,
@@ -49,6 +84,7 @@ impl Server {
         use std::os::unix::fs::PermissionsExt as _;
 
         let bin = env::var("NVIM_BIN").expect("Set NVIM_BIN to Neovim v0.12.6");
+        let sshd = sshd_bin();
         let root = tempdir().unwrap();
         let user = process::Command::new("id").arg("-un").output().unwrap();
         assert!(user.status.success());
@@ -114,16 +150,15 @@ LogLevel DEBUG2
         .unwrap();
         fs::set_permissions(&nvim, fs::Permissions::from_mode(0o700)).unwrap();
         let log = fs::File::create(root.path().join("sshd.log")).unwrap();
-        let daemon =
-            AsyncCommand::new(env::var("SSHD_BIN").unwrap_or_else(|_| "/usr/sbin/sshd".to_owned()))
-                .args(["-D", "-e", "-f"])
-                .arg(root.path().join("sshd_config"))
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(log)
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap();
+        let daemon = AsyncCommand::new(&sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(root.path().join("sshd_config"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap_or_else(|err| panic!("Failed to launch sshd at {}: {err}", sshd.display()));
         let mut server = Self {
             socket: root.path().join("remote host.sock"),
             nvim,
