@@ -21,7 +21,7 @@ use crate::connection::Grids;
 use crate::resources::Resources;
 #[cfg(feature = "plugin-clipboard")]
 use crate::resources::clipboard::Clipboard;
-use crate::{ClientId, EngineEvent};
+use crate::{ClientId, EngineEvent, is_spec_string};
 
 #[cfg(any(
     feature = "plugin-local-forward",
@@ -328,7 +328,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Handler<W> for Dispatch {
 }
 
 fn wire_error(s: String) -> String {
-    if s.starts_with('\u{feff}') || s.contains('\0') {
+    if !is_spec_string(&s) {
         s.chars()
             .enumerate()
             .map(|(idx, c)| {
@@ -356,7 +356,7 @@ fn validate_params(params: &Array) -> Result<(), String> {
         match value {
             Object::Str(s) | Object::Bin(s) => {
                 let s = s.as_str().map_err(|_| "RPC strings must be valid UTF-8")?;
-                if s.starts_with('\u{feff}') || s.contains('\0') {
+                if !is_spec_string(s) {
                     return Err("RPC strings must not begin with U+FEFF or contain NUL".into());
                 }
             }

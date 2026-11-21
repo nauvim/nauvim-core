@@ -317,6 +317,8 @@ async fn rejects_invalid_operation_types_and_ranges_before_allocating_resources(
 
     let (mut dispatch, mut events, dir) = dispatch(7);
     dispatch.policies = Policies::default();
+    #[cfg(feature = "plugin-http")]
+    std::fs::write(dir.path().join("file"), b"fixture").unwrap();
     let cases = [
         #[cfg(feature = "plugin-local-forward")]
         (
@@ -365,7 +367,7 @@ async fn rejects_invalid_operation_types_and_ranges_before_allocating_resources(
                 arguments((7, "file", 0, "true", true)),
                 arguments((7, "file", 0, 1, true)),
                 arguments((7, "file", 0, true, Nil)),
-                arguments((7, "file", 0, false, false)),
+                arguments((7, "file", 0, false, true)),
                 arguments((7, "file", 0, true, true, false)),
             ],
         ),
@@ -407,11 +409,13 @@ async fn rejects_invalid_operation_types_and_ranges_before_allocating_resources(
                     || error.contains("out of range")
                     || error.contains("Too many")
                     || error.contains("Host TCP port")
-                    || error.contains("At least one"),
+                    || error == "HTTP/2 requires HTTPS",
                 "method={method}, input={input:?}, error={error}",
             );
         }
     }
+    #[cfg(feature = "plugin-http")]
+    std::fs::remove_file(dir.path().join("file")).unwrap();
     assert_eq!(read_dir(dir.path()).unwrap().count(), 0);
     assert_eq!(dispatch.resources.reserve().await.unwrap().get(), 1);
     assert!(events.try_recv().is_err());

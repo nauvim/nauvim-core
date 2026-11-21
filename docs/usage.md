@@ -32,7 +32,9 @@ interface.
 
 The file returns a configuration table. Predefined field names use snake_case,
 except within UI-specific option dictionaries. Host aliases are case-sensitive
-strings and can contain punctuation.
+strings and can contain punctuation. String settings, including values returned
+by configuration functions, must be valid UTF-8 without NUL or an initial
+U+FEFF.
 
 ```lua
 local client = require("nauvim-client-info")
@@ -234,15 +236,16 @@ Selection never merges dictionaries.
 
 Every outer mapping key, non-nil selector, and supplied implementation ID must
 be non-empty valid UTF-8, must not begin with U+FEFF, and must not contain NUL.
-Every non-nil entry must be a dictionary with string keys. Functions are rejected
-at every nesting level, including nested table keys and values. Core checks
-these common requirements for all entries, including unselected entries.
+Every non-nil entry must be a dictionary with string keys. Values may be nil,
+booleans, integers, floating-point numbers, strings, lists, or string-keyed
+dictionaries. Nested Lua lists use contiguous integer keys starting at `1`.
+Core rejects cyclic tables and values such as functions, threads, and userdata.
+All string keys and values must be valid UTF-8 without NUL or an initial U+FEFF.
+Inner strings may be empty and may contain U+FEFF after the first character.
+Core checks these requirements for all entries, including unselected entries.
 
-Beyond those checks, option contents are opaque to core. Dictionary field names
-need not use snake_case, and inner strings and numbers receive no additional
-encoding or range restrictions. The frontend interprets and validates only the
-selected dictionary against its own schema. Unselected dictionaries receive
-common validation only. A common or selected-schema validation failure during
+Dictionary field names may use any valid string. The frontend validates the
+selected dictionary against its own schema. A common or selected-schema failure during
 file loading selects the complete default configuration and produces a
 diagnostic as described under [loading configuration](#loading-configuration).
 
@@ -270,7 +273,8 @@ only the functionality the application needs.
 Client registration and session switching are always present. Disabled plugin
 methods are handled as unknown methods after the process client-ID check.
 
-HTTP file serving supports HTTPS HTTP/1.1, HTTPS HTTP/2, and cleartext HTTP/2.
+File serving supports HTTP/1.1 with and without TLS. HTTP/2 requires HTTPS,
+so `https = false, http2 = true` returns a request error before server startup.
 HTTPS uses generated self-signed certificates. Linux file confinement checks use
 `/proc/self/fd`; `/proc` must be available. macOS uses `F_GETPATH`. The opened
 file's resolved location is checked before serving it.

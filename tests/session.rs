@@ -221,8 +221,8 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
         local ui = uis[1]
         local info = vim.api.nvim_get_chan_info(ui.chan).client
         local version = info.version
-        return info.name == "nauvim-client-{}" and info.type == "ui"
-            and version.major == 0 and version.minor == 2 and version.patch == 0
+        return info.name == "nauvim-client-{client_id}" and info.type == "ui"
+            and version.major == {major} and version.minor == {minor} and version.patch == {patch}
             and vim.tbl_count(info.methods) == 0
             and vim.tbl_count(info.attributes) == 1
             and info.attributes.license == "MIT OR Apache-2.0"
@@ -230,7 +230,9 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
             and ui.ext_messages and ui.ext_popupmenu and ui.ext_tabline
             and ui.ext_hlstate and ui.ext_termcolors
         "#,
-                client_id
+                major = env!("CARGO_PKG_VERSION_MAJOR"),
+                minor = env!("CARGO_PKG_VERSION_MINOR"),
+                patch = env!("CARGO_PKG_VERSION_PATCH"),
             )
         )
         .await

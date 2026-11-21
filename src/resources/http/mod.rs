@@ -10,7 +10,7 @@ use hyper::header::{
 };
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::fs::{self, File};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -20,7 +20,6 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use std::convert::Infallible;
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -122,7 +121,7 @@ impl Resources {
     /// Validates the serving root and starts a loopback HTTP(S) server.
     ///
     /// HTTPS uses a generated self-signed certificate. `http2` selects HTTP/2
-    /// exclusively; a false value selects HTTP/1.1 and requires HTTPS.
+    /// exclusively and requires HTTPS. HTTP/1.1 supports plain HTTP and HTTPS.
     pub async fn serve_file(
         &self,
         client_file: String,
@@ -130,9 +129,6 @@ impl Resources {
         https: bool,
         http2: bool,
     ) -> Result<ResourceHandle, String> {
-        if !https && !http2 {
-            return Err("At least one of https and http2 must be true".to_owned());
-        }
         let root = self.client_path(&client_file)?;
         let root = fs::canonicalize(&root)
             .await
@@ -142,6 +138,9 @@ impl Resources {
             .map_err(|e| format!("Inspect HTTP serving root {}: {e}", root.display()))?;
         if !metadata.is_dir() && !metadata.is_file() {
             return Err("HTTP serving root must be a regular file or directory".to_owned());
+        }
+        if http2 && !https {
+            return Err("HTTP/2 requires HTTPS".to_owned());
         }
         let root = if metadata.is_file() {
             ServingRoot::File(root)
@@ -313,10 +312,18 @@ async fn serve_stream<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |request| {
+    let service = service_fn(move |request: Request<_>| {
         let root = root.clone();
         let origin = origin.clone();
-        async move { Ok::<_, Infallible>(response(request, &root, &origin, http2).await) }
+        async move {
+            if !http2 && request.version() != Version::HTTP_11 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Only HTTP/1.1 is supported",
+                ));
+            }
+            Ok(response(request, &root, &origin, http2).await)
+        }
     });
     if http2 {
         http2::Builder::new(TokioExecutor::new())
@@ -710,10 +717,186 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn serves_http2_over_loopback_and_reports_binding_failure() {
-        use hyper::client::conn::http2 as client_http2;
+    #[derive(Debug)]
+    struct LoopbackCertificate(tokio_rustls::rustls::crypto::WebPkiSupportedAlgorithms);
 
+    impl tokio_rustls::rustls::client::danger::ServerCertVerifier for LoopbackCertificate {
+        fn verify_server_cert(
+            &self,
+            _: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            _: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
+            _: &tokio_rustls::rustls::pki_types::ServerName<'_>,
+            _: &[u8],
+            _: tokio_rustls::rustls::pki_types::UnixTime,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::ServerCertVerified,
+            tokio_rustls::rustls::Error,
+        > {
+            // The server creates a new self-signed certificate at startup.
+            Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            signed: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+            tokio_rustls::rustls::Error,
+        > {
+            tokio_rustls::rustls::crypto::verify_tls12_signature(message, cert, signed, &self.0)
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
+            signed: &tokio_rustls::rustls::DigitallySignedStruct,
+        ) -> Result<
+            tokio_rustls::rustls::client::danger::HandshakeSignatureValid,
+            tokio_rustls::rustls::Error,
+        > {
+            tokio_rustls::rustls::crypto::verify_tls13_signature(message, cert, signed, &self.0)
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+            self.0.supported_schemes()
+        }
+    }
+
+    async fn connect_https(
+        socket: TcpStream,
+        alpn: &[u8],
+    ) -> tokio_rustls::client::TlsStream<TcpStream> {
+        use tokio_rustls::{
+            TlsConnector,
+            rustls::{ClientConfig, crypto::ring, pki_types::ServerName},
+        };
+
+        let provider = ring::default_provider();
+        let verifier = LoopbackCertificate(provider.signature_verification_algorithms);
+        let mut config = ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![alpn.to_vec()];
+        let stream = TlsConnector::from(Arc::new(config))
+            .connect(ServerName::from(Ipv4Addr::LOCALHOST), socket)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(alpn));
+        stream
+    }
+
+    #[tokio::test]
+    async fn serves_the_three_supported_protocol_combinations_on_loopback() {
+        use hyper::client::conn::{http1 as client_http1, http2 as client_http2};
+
+        async fn get_http1<S>(socket: S, request: Request<Empty<Bytes>>) -> Response<body::Incoming>
+        where
+            S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        {
+            let (mut client, connection) =
+                client_http1::handshake(TokioIo::new(socket)).await.unwrap();
+            spawn(connection);
+            client.send_request(request).await.unwrap()
+        }
+
+        timeout(Duration::from_secs(5), async {
+            let dir = tempdir().unwrap();
+            fs::write(dir.path().join("hello.html"), b"<h1>Hello</h1>")
+                .await
+                .unwrap();
+            let (errors, mut messages) = mpsc::unbounded_channel();
+            let resources = Resources::new(dir.path().to_owned(), errors);
+            let error = resources
+                .serve_file("hello.html".to_owned(), 0, false, true)
+                .await
+                .unwrap_err();
+            assert_eq!(error, "HTTP/2 requires HTTPS");
+            assert!(resources.registry.state.lock().await.entries.is_empty());
+
+            for (https, http2) in [(false, false), (true, false), (true, true)] {
+                let handle = resources
+                    .serve_file("/hello.html".to_owned(), 0, https, http2)
+                    .await
+                    .unwrap();
+                let port = resources.get_http_port(handle).await.unwrap().unwrap();
+                let socket = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+                    .await
+                    .unwrap();
+                let scheme = if https { "https" } else { "http" };
+                let origin = format!("{scheme}://127.0.0.1:{port}");
+                let request = Request::builder()
+                    .uri(format!("{origin}/"))
+                    .header("host", format!("127.0.0.1:{port}"))
+                    .version(if http2 {
+                        Version::HTTP_2
+                    } else {
+                        Version::HTTP_11
+                    })
+                    .body(Empty::<Bytes>::new())
+                    .unwrap();
+                let expected_version = request.version();
+                let response = if http2 {
+                    let tls = connect_https(socket, b"h2").await;
+                    let (mut client, connection) =
+                        client_http2::handshake(TokioExecutor::new(), TokioIo::new(tls))
+                            .await
+                            .unwrap();
+                    spawn(connection);
+                    client.send_request(request).await.unwrap()
+                } else if https {
+                    get_http1(connect_https(socket, b"http/1.1").await, request).await
+                } else {
+                    get_http1(socket, request).await
+                };
+                assert_eq!(response.version(), expected_version);
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
+                assert_eq!(response.headers()[CONTENT_LENGTH], "14");
+                assert_eq!(response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN], origin);
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    "<h1>Hello</h1>"
+                );
+                resources.clear_http(handle).await;
+                assert!(resources.get_http_port(handle).await.is_err());
+            }
+            resources.cleanup().await;
+            assert!(messages.try_recv().is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn http1_server_does_not_serve_http_10() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex};
+
+        timeout(Duration::from_secs(5), async {
+            let (mut client, server) = duplex(8192);
+            let server = spawn(serve_stream(
+                server,
+                false,
+                Arc::new(ServingRoot::Directory(PathBuf::from("/unused"))),
+                "http://127.0.0.1:1234".to_owned(),
+            ));
+            client.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+            let mut response = Vec::new();
+            client.read_to_end(&mut response).await.unwrap();
+            assert!(response.is_empty());
+            assert!(server.await.unwrap().is_err());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reports_binding_failure_and_releases_the_port_on_clear() {
         use tokio::task::yield_now;
 
         timeout(Duration::from_secs(5), async {
@@ -723,47 +906,13 @@ mod tests {
                 .unwrap();
             let (errors, mut messages) = mpsc::unbounded_channel();
             let resources = Resources::new(dir.path().to_owned(), errors);
-            assert!(
-                resources
-                    .serve_file("hello.html".to_owned(), 0, false, false)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                resources
-                    .serve_file("missing".to_owned(), 0, false, true)
-                    .await
-                    .is_err()
-            );
             let handle = resources
-                .serve_file("/hello.html".to_owned(), 0, false, true)
+                .serve_file("hello.html".to_owned(), 0, false, false)
                 .await
                 .unwrap();
             let port = resources.get_http_port(handle).await.unwrap().unwrap();
-            let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-            let (mut client, connection) =
-                client_http2::handshake(TokioExecutor::new(), TokioIo::new(socket))
-                    .await
-                    .unwrap();
-            let connection = spawn(connection);
-            let request = Request::builder()
-                .uri(format!("http://127.0.0.1:{port}/"))
-                .body(Empty::<Bytes>::new())
-                .unwrap();
-            let response = client.send_request(request).await.unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()[CONTENT_TYPE], "text/html; charset=utf-8");
-            assert_eq!(response.headers()[CONTENT_LENGTH], "14");
-            assert_eq!(
-                response.headers()[ACCESS_CONTROL_ALLOW_ORIGIN],
-                format!("http://127.0.0.1:{port}")
-            );
-            assert_eq!(
-                response.into_body().collect().await.unwrap().to_bytes(),
-                "<h1>Hello</h1>"
-            );
             let busy = resources
-                .serve_file("hello.html".to_owned(), port, false, true)
+                .serve_file("hello.html".to_owned(), port, false, false)
                 .await
                 .unwrap();
             let error = resources.get_http_port(busy).await.unwrap_err();
@@ -771,19 +920,12 @@ mod tests {
             assert_eq!(messages.recv().await.unwrap(), error);
             resources.clear_http(handle).await;
             loop {
-                match TcpListener::bind(("127.0.0.1", port)).await {
-                    Ok(listener) => {
-                        drop(listener);
-                        break;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-                        yield_now().await;
-                    }
+                match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+                    Ok(_) => break,
+                    Err(e) if e.kind() == io::ErrorKind::AddrInUse => yield_now().await,
                     Err(e) => panic!("Rebind cleared HTTP port: {e}"),
                 }
             }
-            drop(client);
-            connection.abort();
             resources.cleanup().await;
             assert!(resources.reserve().await.is_err());
         })
@@ -792,43 +934,36 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Requires curl and permission to bind loopback sockets"]
-    async fn serves_https_with_a_self_signed_certificate() {
-        use tokio::process::Command;
+    async fn clearing_pending_http_startup_completes_a_port_query() {
+        use std::future::{Future, poll_fn};
 
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("hello.txt"), b"HTTPS works")
-            .await
-            .unwrap();
-        let (errors, mut messages) = mpsc::unbounded_channel();
+        let (errors, _messages) = mpsc::unbounded_channel();
         let resources = Resources::new(dir.path().to_owned(), errors);
-        let handle = resources
-            .serve_file("hello.txt".to_owned(), 0, true, false)
-            .await
-            .unwrap();
-        let port = resources.get_http_port(handle).await.unwrap().unwrap();
-        let output = Command::new("curl")
-            .args([
-                "--insecure",
-                "--http1.1",
-                "--max-time",
-                "5",
-                "--silent",
-                "--show-error",
-                "--fail",
-            ])
-            .arg(format!("https://127.0.0.1:{port}/"))
-            .output()
-            .await
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        let (_binding, outcome) = watch::channel(Binding::Pending);
+        let resource = Resource::new(
+            Data::Http {
+                path: fs::canonicalize(dir.path()).await.unwrap().join("file"),
+                binding: outcome,
+            },
+            &resources.stop,
+            &resources.owner,
         );
-        assert_eq!(output.stdout, b"HTTPS works");
-        resources.cleanup().await;
-        assert!(messages.try_recv().is_err());
+        let handle = resources.insert(resource).await.unwrap();
+        let mut getting_port = std::pin::pin!(resources.get_http_port(handle));
+        poll_fn(|cx| {
+            assert!(getting_port.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+        resources.clear_http(handle).await;
+        assert_eq!(
+            timeout(Duration::from_secs(5), getting_port)
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
     }
 
     #[tokio::test]
@@ -874,7 +1009,7 @@ mod tests {
         for input in ["", ".", "/", "escape", "../outside"] {
             assert!(
                 resources
-                    .serve_file(input.to_owned(), 0, false, true)
+                    .serve_file(input.to_owned(), 0, false, false)
                     .await
                     .is_err(),
                 "{input:?}"

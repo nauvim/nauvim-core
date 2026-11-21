@@ -1,5 +1,7 @@
 use crate::Error;
 
+use super::lua_string;
+
 use mlua::Value;
 
 use std::time::Duration;
@@ -38,7 +40,7 @@ impl ClipboardConfig {
         let mut ret = Self::default();
         match value {
             Value::Nil => {}
-            Value::String(s) => ret.backend = s.to_str()?.to_string(),
+            Value::String(s) => ret.backend = lua_string(&s, "clipboard")?.to_string(),
             Value::Table(t) => {
                 for pair in t.clone().pairs::<Value, Value>() {
                     let (key, _) = pair?;
@@ -51,7 +53,9 @@ impl ClipboardConfig {
                 }
                 match t.get::<Value>("backend")? {
                     Value::Nil => {}
-                    Value::String(backend) => ret.backend = backend.to_str()?.to_string(),
+                    Value::String(backend) => {
+                        ret.backend = lua_string(&backend, "clipboard.backend")?.to_string()
+                    }
                     _ => return Err(Error::Message("clipboard.backend must be a string".into())),
                 }
                 match t.get::<Value>("timeout_ms")? {

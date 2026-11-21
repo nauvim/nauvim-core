@@ -1,6 +1,6 @@
 use crate::Error;
 
-use mlua::{Function, Lua, Table, Value};
+use mlua::{BorrowedStr, Function, Lua, Table, Value};
 
 use directories::BaseDirs;
 
@@ -12,7 +12,7 @@ pub use info::{HostInfo, ProjectDirs};
 mod clipboard;
 pub use clipboard::ClipboardConfig;
 mod ui_opts;
-pub use ui_opts::{UiConfig, UiObjectId, UiTable, UiTableId, UiValue};
+pub use ui_opts::{UiConfig, UiTable, UiTableId, UiValue};
 pub(crate) mod program;
 use program::ProgramSetting;
 #[cfg(feature = "ssh")]
@@ -47,7 +47,7 @@ impl Setting {
     fn parse(v: Value, field: &str) -> Result<Option<Self>, Error> {
         match v {
             Value::Nil => Ok(None),
-            Value::String(s) => Ok(Some(Self::Text(s.to_str()?.to_string()))),
+            Value::String(s) => Ok(Some(Self::Text(lua_string(&s, field)?.to_string()))),
             Value::Function(f) => Ok(Some(Self::Function(f))),
             _ => Err(Error::Message(format!(
                 "{field} must be a string or function"
@@ -62,7 +62,7 @@ impl Setting {
                 let info =
                     info.ok_or_else(|| Error::Message("Host information is unavailable".into()))?;
                 match f.call::<Value>(info.table(lua)?)? {
-                    Value::String(s) => Ok(s.to_str()?.to_string()),
+                    Value::String(s) => Ok(lua_string(&s, "socket callback result")?.to_string()),
                     _ => Err(Error::Message(
                         "Host path callback must return a string".into(),
                     )),
@@ -254,7 +254,7 @@ impl Config {
         let default_host = match t.get::<Value>("default_host")? {
             Value::Nil => None,
             Value::String(s) => {
-                let s = s.to_str()?.to_string();
+                let s = lua_string(&s, "default_host")?.to_string();
                 if s.is_empty() {
                     return Err(Error::Message("default_host must be non-empty".into()));
                 }
@@ -272,7 +272,7 @@ impl Config {
                 let Value::String(alias) = alias else {
                     return Err(Error::Message("Host aliases must be strings".into()));
                 };
-                let alias = alias.to_str()?.to_string();
+                let alias = lua_string(&alias, "Host alias")?.to_string();
                 fields(&h, &["nvim", "socket", "ssh", "policies"], "host")?;
                 let remote = h.get::<Option<Table>>("ssh")?;
                 #[cfg(feature = "ssh")]
@@ -385,7 +385,8 @@ impl Config {
 
 fn reject_kebab(t: &Table) -> Result<(), Error> {
     for pair in t.clone().pairs::<String, Value>() {
-        if pair?.0.contains('-') {
+        let (key, _) = pair?;
+        if key.contains('-') {
             return Err(Error::Message(
                 "Configuration field names must use snake_case".into(),
             ));
@@ -398,6 +399,25 @@ fn reject_kebab(t: &Table) -> Result<(), Error> {
 fn validate_disabled_ssh(t: Option<&Table>) -> Result<(), Error> {
     if let Some(t) = t {
         reject_kebab(t)?;
+        let mut pending = vec![t.clone()];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(table) = pending.pop() {
+            if !visited.insert(table.to_pointer()) {
+                continue;
+            }
+            for pair in table.pairs::<Value, Value>() {
+                let (key, value) = pair?;
+                for value in [key, value] {
+                    match value {
+                        Value::String(s) => {
+                            lua_string(&s, "SSH setting")?;
+                        }
+                        Value::Table(table) => pending.push(table),
+                        _ => {}
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -412,7 +432,7 @@ fn fields(t: &Table, accepted: &[&str], context: &str) -> Result<(), Error> {
                 "{context} field names must be strings"
             )));
         };
-        let key = key.to_str()?;
+        let key = lua_string(&key, "Configuration field name")?;
         if !accepted.contains(&key.as_ref()) {
             return Err(Error::Message(format!("Unknown {context} field: {key}")));
         }
@@ -424,7 +444,7 @@ fn global_path(t: &Table, field: &str) -> Result<Option<PathBuf>, Error> {
     match t.get::<Value>(field)? {
         Value::Nil => Ok(None),
         Value::String(s) => {
-            let path = PathBuf::from(s.to_str()?.as_ref());
+            let path = PathBuf::from(lua_string(&s, field)?.as_ref());
             if !path.is_absolute() {
                 return Err(Error::Message(format!(
                     "ssh.{field} must be a non-empty absolute path"
@@ -435,5 +455,62 @@ fn global_path(t: &Table, field: &str) -> Result<Option<PathBuf>, Error> {
         _ => Err(Error::Message(format!(
             "ssh.{field} must be an absolute path string"
         ))),
+    }
+}
+
+fn validate_string(value: &str, field: &str) -> Result<(), Error> {
+    if crate::is_spec_string(value) {
+        Ok(())
+    } else {
+        Err(Error::Message(format!(
+            "{field} must not begin with U+FEFF or contain NUL"
+        )))
+    }
+}
+
+fn lua_string<'a>(value: &'a mlua::String, field: &str) -> Result<BorrowedStr<'a>, Error> {
+    let text = value
+        .to_str()
+        .map_err(|_| Error::Message(format!("{field} must be valid UTF-8")))?;
+    validate_string(&text, field)?;
+    Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_socket_callback_results() {
+        let lua = Lua::new();
+        let info = HostInfo {
+            host_name: "test".into(),
+            user: "test".into(),
+            config_file: None,
+            home_dir: "/home".into(),
+            project_dirs: ProjectDirs {
+                cache_dir: "/cache".into(),
+                data_dir: "/data".into(),
+                runtime_dir: "/runtime".into(),
+            },
+        };
+        for (source, expected) in [
+            (r"return function(_) return 'so\0cket' end", None),
+            (r"return function(_) return '\239\187\191socket' end", None),
+            (r"return function(_) return '\255' end", None),
+            (
+                r"return function(_) return 'so\239\187\191cket' end",
+                Some("so\u{feff}cket"),
+            ),
+        ] {
+            let setting = Setting::parse(lua.load(source).eval().unwrap(), "socket")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                setting.resolve(Some(&info), &lua).ok().as_deref(),
+                expected,
+                "{source}"
+            );
+        }
     }
 }

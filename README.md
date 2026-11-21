@@ -14,7 +14,7 @@ provides its renderer and GUI windows; the separate Lua plugin is optional for
 ordinary editor operation.
 
 This implementation targets `nauvim-spec` commit
-[`8e23c1cd5705cc4f06e8a0acbb567ab27c3bb0f3`](https://github.com/nauvim/nauvim-spec/tree/8e23c1cd5705cc4f06e8a0acbb567ab27c3bb0f3).
+[`cc51d1ecc51869d8eafb68f243cf0adff6f390bb`](https://github.com/nauvim/nauvim-spec/tree/cc51d1ecc51869d8eafb68f243cf0adff6f390bb).
 
 When the referenced `nauvim-spec` commit hash changes, `nauvim-core` increases its
 minor or major version. When the hash stays the same, it increases its patch
