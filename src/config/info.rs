@@ -2,6 +2,7 @@ use crate::Error;
 
 use super::validate_string;
 
+use directories::BaseDirs;
 use mlua::{Lua, Table};
 
 use std::collections::VecDeque;
@@ -30,8 +31,6 @@ pub struct HostInfo {
 impl HostInfo {
     /// Acquires local information; `config_file` distinguishes the client role.
     pub fn local(config_file: Option<&Path>) -> Result<Self, Error> {
-        use directories::BaseDirs;
-
         let dirs = BaseDirs::new()
             .ok_or_else(|| Error::Message("Cannot determine home directory".into()))?;
         let (host_name, user) = local_identity()?;
@@ -46,10 +45,6 @@ impl HostInfo {
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| dirs.cache_dir().to_path_buf());
-        let data = env::var_os("XDG_DATA_HOME")
-            .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| dirs.data_dir().to_path_buf());
         Ok(Self {
             host_name,
             user,
@@ -57,7 +52,7 @@ impl HostInfo {
             home_dir: resolve_path(dirs.home_dir())?,
             project_dirs: ProjectDirs {
                 cache_dir: resolve_path(&cache.join("nauvim"))?,
-                data_dir: resolve_path(&data.join("nauvim"))?,
+                data_dir: project_data_dir(&dirs)?,
                 runtime_dir: resolve_path(&runtime.join("nauvim"))?,
             },
         })
@@ -118,6 +113,20 @@ impl HostInfo {
         t.set("project_dirs", dirs)?;
         Ok(t)
     }
+}
+
+pub(crate) fn local_data_dir() -> Result<PathBuf, Error> {
+    let dirs =
+        BaseDirs::new().ok_or_else(|| Error::Message("Cannot determine home directory".into()))?;
+    project_data_dir(&dirs)
+}
+
+fn project_data_dir(dirs: &BaseDirs) -> Result<PathBuf, Error> {
+    let data_dir = env::var_os("XDG_DATA_HOME")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs.data_dir().to_path_buf());
+    resolve_path(&data_dir.join("nauvim"))
 }
 
 pub(crate) fn local_identity() -> Result<(String, String), Error> {

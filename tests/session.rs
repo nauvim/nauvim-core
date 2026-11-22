@@ -1,4 +1,11 @@
-use nauvim_core::{Client, Config, Engine, EngineEvent, Frame};
+use nauvim_core::{Client, Config, Engine, EngineEvent};
+
+mod support;
+use support::checkpoint::{
+    assert_no_markers, hidden_grids, leave_inactive_tab, next_frame, restored_grids,
+    revisit_inactive_tab,
+};
+use support::{is_clipboard_detection_error, isolated_config};
 
 use nvim_rpc_plugin::{Object, api};
 
@@ -40,11 +47,7 @@ fn config(root: &Path, socket: &Path) -> Config {
         lua_string(socket.to_str().unwrap()),
         lua_string(socket.with_extension("next.sock").to_str().unwrap())
     );
-    let path = root.join("config.lua");
-    fs::write(&path, src).unwrap();
-    let (config, ()) =
-        Config::load(Some(&path), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
-    config
+    isolated_config(root, &src, "org.example.nauvim.session-test")
 }
 
 async fn lua_bool(client: &Client, src: &str) -> bool {
@@ -76,28 +79,13 @@ async fn wait_setup(engine: &Engine, client: &Client) {
     .expect("host-side asynchronous setup did not run");
 }
 
-async fn next_frame(engine: &mut Engine) -> Frame {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            match engine.next_event().await {
-                EngineEvent::Frame(frame) => return frame,
-                EngineEvent::Error(e) | EngineEvent::Welcome { error: Some(e) } => {
-                    panic!("unexpected engine error: {e}")
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("Neovim did not publish a frame")
-}
-
 async fn next_welcome(engine: &mut Engine) -> Option<String> {
     timeout(Duration::from_secs(5), async {
         loop {
             match engine.next_event().await {
                 EngineEvent::Welcome { error } => return error,
                 EngineEvent::Frame(_) => {}
+                EngineEvent::Error(e) if is_clipboard_detection_error(&e) => {}
                 EngineEvent::Error(e) => panic!("unexpected error event: {e}"),
                 _ => panic!("unexpected plugin event while awaiting welcome page"),
             }
@@ -176,21 +164,12 @@ async fn live_reopens_a_short_default_local_socket() {
     let nvim = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
     let root = tempdir().unwrap();
     let alias = root.path().file_name().unwrap().to_str().unwrap();
-    let file = root.path().join("config.lua");
-    fs::write(
-        &file,
-        format!(
-            r#"return {{hosts = {{[{}] = {{nvim = {{prog = {}, args = {{'-u', 'NONE', '-i', 'NONE', '-n'}}}}}}}}}}"#,
-            lua_string(alias),
-            lua_string(&nvim),
-        ),
-    )
-    .unwrap();
-    let config = || {
-        Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(()))
-            .unwrap()
-            .0
-    };
+    let src = format!(
+        r#"return {{hosts = {{[{}] = {{nvim = {{prog = {}, args = {{'-u', 'NONE', '-i', 'NONE', '-n'}}}}}}}}}}"#,
+        lua_string(alias),
+        lua_string(&nvim),
+    );
+    let config = || isolated_config(root.path(), &src, "org.example.nauvim.session-test");
     let mut first = Engine::new(config()).unwrap();
     first.connect(alias, 60, 16).await.unwrap();
     let client = first.client().unwrap();
@@ -395,6 +374,197 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
 
 #[tokio::test]
 #[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_restores_checkpoints_when_reattaching_and_switching_owned_hosts() {
+    let root = tempdir().unwrap();
+    let socket = root.path().join("checkpoint.sock");
+    let mut engine = Engine::new(config(root.path(), &socket)).unwrap();
+    engine.connect("local_host", 80, 24).await.unwrap();
+    let client = engine.client().unwrap();
+    let host_pid = pid(&client).await;
+    leave_inactive_tab(&client).await;
+
+    engine.detach().await.unwrap();
+    engine.connect("local_host", 80, 24).await.unwrap();
+    assert_eq!(pid(&engine.client().unwrap()).await, host_pid);
+    assert!(client.command("echo 'closed'").await.is_err());
+    let grids = restored_grids(&mut engine).await;
+
+    engine.connect("next_host", 80, 24).await.unwrap();
+    let other = engine.client().unwrap();
+    assert_ne!(pid(&other).await, host_pid);
+    assert_no_markers(&next_frame(&mut engine).await);
+    let _ = timeout(Duration::from_secs(5), other.command("qa!"))
+        .await
+        .unwrap();
+    assert_eq!(next_welcome(&mut engine).await, None);
+
+    engine.connect("local_host", 80, 24).await.unwrap();
+    let client = engine.client().unwrap();
+    assert_eq!(pid(&client).await, host_pid);
+    assert_eq!(restored_grids(&mut engine).await, grids);
+    revisit_inactive_tab(&mut engine, &client, &grids).await;
+
+    let _ = timeout(Duration::from_secs(5), client.command("qa!"))
+        .await
+        .unwrap();
+    assert_eq!(next_welcome(&mut engine).await, None);
+    engine.connect("local_host", 80, 24).await.unwrap();
+    assert_ne!(pid(&engine.client().unwrap()).await, host_pid);
+    assert_no_markers(&next_frame(&mut engine).await);
+    quit(&mut engine).await;
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_restores_an_inactive_tab_in_a_new_client_process() {
+    use nvim_rpc_ui::{Checkpoint, Limits};
+
+    use rusqlite::{Connection, OpenFlags, OptionalExtension as _};
+
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::process;
+
+    const TEST: &str = "live_restores_an_inactive_tab_in_a_new_client_process";
+    const ROOT: &str = "NAUVIM_CHECKPOINT_TEST_ROOT";
+    const STAGE: &str = "NAUVIM_CHECKPOINT_TEST_STAGE";
+    const PID_FILE: &str = "host-pid";
+    const TEMP_DIR_FILE: &str = "client-temp-dir";
+
+    async fn wait_for_disk_checkpoint(root: &Path) {
+        let db = Connection::open_with_flags(
+            root.join("data/ui-checkpoints.sqlite3"),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.busy_timeout(Duration::from_millis(100)).unwrap();
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let stored: Option<Vec<u8>> = db
+                    .query_row("SELECT checkpoint FROM ui_checkpoints", [], |row| {
+                        row.get(0)
+                    })
+                    .optional()
+                    .unwrap();
+                if let Some(stored) = stored {
+                    let checkpoint =
+                        Checkpoint::decode(&stored, Limits::default(), stored.len()).unwrap();
+                    if hidden_grids(checkpoint.state()).is_some() {
+                        break;
+                    }
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the active client did not save the hidden grids to disk");
+    }
+
+    if let Some(root) = env::var_os(ROOT) {
+        let root = Path::new(&root);
+        let socket = root.join("checkpoint.sock");
+        let mut engine = Engine::new(config(root, &socket)).unwrap();
+        engine.connect("local_host", 80, 24).await.unwrap();
+        let client = engine.client().unwrap();
+        let host_pid = pid(&client).await;
+
+        match env::var(STAGE).as_deref() {
+            Ok("prepare") => {
+                fs::write(root.join(PID_FILE), host_pid.to_string()).unwrap();
+                fs::write(
+                    root.join(TEMP_DIR_FILE),
+                    engine.temp_dir().as_os_str().as_encoded_bytes(),
+                )
+                .unwrap();
+                leave_inactive_tab(&client).await;
+
+                // Neither a frame consumer nor client shutdown saves this checkpoint.
+                wait_for_disk_checkpoint(root).await;
+                process::exit(0);
+            }
+            Ok("restore") => {
+                let original = fs::read_to_string(root.join(PID_FILE)).unwrap();
+                assert_eq!(host_pid, original.parse::<i64>().unwrap());
+                let grids = restored_grids(&mut engine).await;
+                revisit_inactive_tab(&mut engine, &client, &grids).await;
+                quit(&mut engine).await;
+            }
+            stage => panic!("unexpected checkpoint fixture stage {stage:?}"),
+        }
+        return;
+    }
+
+    let root = tempdir().unwrap();
+    for stage in ["prepare", "restore"] {
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", TEST, "--nocapture"])
+            .env(ROOT, root.path())
+            .env(STAGE, stage)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = timeout(Duration::from_secs(30), child.wait()).await;
+        if !matches!(&result, Ok(Ok(_))) {
+            let _ = child.kill().await;
+        }
+        if stage == "prepare"
+            && let Ok(dir) = fs::read(root.path().join(TEMP_DIR_FILE))
+        {
+            let _ = fs::remove_dir(OsString::from_vec(dir));
+        }
+        if !matches!(&result, Ok(Ok(status)) if status.success()) {
+            if let Ok(host_pid) = fs::read_to_string(root.path().join(PID_FILE)) {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &host_pid])
+                    .status()
+                    .await;
+            }
+            panic!("checkpoint fixture for {stage:?} failed: {result:?}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_reports_a_corrupt_checkpoint_database_and_still_attaches() {
+    let root = tempdir().unwrap();
+    let data = root.path().join("data");
+    fs::create_dir(&data).unwrap();
+    let database = data.join("ui-checkpoints.sqlite3");
+    let corrupt = b"this is not a SQLite database";
+    fs::write(&database, corrupt).unwrap();
+
+    let socket = root.path().join("checkpoint.sock");
+    let mut engine = Engine::new(config(root.path(), &socket)).unwrap();
+    engine.connect("local_host", 80, 24).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        let mut rendered = false;
+        let mut reported = false;
+        while !rendered || !reported {
+            match engine.next_event().await {
+                EngineEvent::Frame(frame) => {
+                    assert!(!frame.state.grids.is_empty());
+                    rendered = true;
+                }
+                EngineEvent::Error(e) if is_clipboard_detection_error(&e) => {}
+                EngineEvent::Error(e) => {
+                    assert!(e.starts_with("Open UI checkpoint database: "), "{e}");
+                    reported = true;
+                }
+                EngineEvent::Welcome { error } => panic!("unexpected detachment: {error:?}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the engine did not report the corrupt database and publish a frame");
+
+    quit(&mut engine).await;
+    assert_eq!(fs::read(&database).unwrap(), corrupt);
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
 async fn live_discards_invalid_client_ids_before_validating_plugin_arguments() {
     let root = tempdir().unwrap();
     let mut engine = Engine::new(config(root.path(), &root.path().join("ids.sock"))).unwrap();
@@ -468,11 +638,7 @@ async fn live_replaces_a_stale_owned_socket_and_preserves_non_socket_entries() {
 #[tokio::test]
 #[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
 async fn live_host_functions_receive_host_role_information() {
-    use nauvim_core::HostInfo;
-
     let root = tempdir().unwrap();
-    let file = root.path().join("config.lua");
-    fs::write(&file, "return {}").unwrap();
     let bin = env::var("NVIM_BIN").expect("set NVIM_BIN");
     let socket = root.path().join("functions.sock");
     let src = format!(
@@ -493,13 +659,7 @@ async fn live_host_functions_receive_host_role_information() {
         lua_string(&bin),
         lua_string(socket.to_str().unwrap())
     );
-    let (config, ()) = Config::evaluate(
-        &src,
-        HostInfo::local(Some(&file)).unwrap(),
-        "org.example.nauvim.session-test",
-        |_| Ok(()),
-    )
-    .unwrap();
+    let config = isolated_config(root.path(), &src, "org.example.nauvim.session-test");
     let mut engine = Engine::new(config).unwrap();
     engine.connect("local_host", 50, 12).await.unwrap();
     assert!(pid(&engine.client().unwrap()).await > 0);
@@ -678,7 +838,6 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
     use std::str;
 
     let root = tempdir().unwrap();
-    let file = root.path().join("config.lua");
     let init = root.path().join("init.lua");
     let socket = root.path().join("literal ' socket.sock");
     let record = root.path().join("argv record");
@@ -703,9 +862,7 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
         lua_string(literal),
         lua_string(socket.to_str().unwrap())
     );
-    fs::write(&file, src).unwrap();
-    let (config, ()) =
-        Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
+    let config = isolated_config(root.path(), &src, "org.example.nauvim.session-test");
     let mut engine = Engine::new(config).unwrap();
     engine.connect("local_host", 80, 24).await.unwrap();
     let client = engine.client().unwrap();

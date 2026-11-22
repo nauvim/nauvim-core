@@ -40,6 +40,7 @@
 //! # }
 //! ```
 
+mod checkpoint;
 mod config;
 pub use config::{
     ClipboardConfig, Config, HostInfo, HostSelection, Policies, ProjectDirs, UiConfig, UiTable,

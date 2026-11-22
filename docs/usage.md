@@ -195,6 +195,20 @@ Discovery probes only the selected endpoint. A refused stale socket is removed.
 An ambiguous or timed-out check leaves the endpoint in place. Socket checks have
 a five-second timeout and attachment has a twenty-second timeout.
 
+### Reattaching to a session
+
+Nauvim keeps a display checkpoint on the client so that a surviving Neovim can
+update grids for inactive tabs after reattachment. This applies to local and
+SSH hosts. If the host Neovim has restarted, Nauvim starts with a fresh display
+model.
+
+Nauvim stores the checkpoints in `ui-checkpoints.sqlite3` in the client data
+directory. On Linux, this is `$XDG_DATA_HOME/nauvim` or
+`$HOME/.local/share/nauvim` when `XDG_DATA_HOME` is unset. The database can
+contain text displayed in the editor. Detachment and client exit preserve it
+for later sessions. If the saved checkpoint cannot be read, Nauvim reports the
+error and attempts attachment with an empty display model.
+
 ## SSH configuration
 
 Global `ssh.config` and `ssh.known_hosts` select the client-side OpenSSH source

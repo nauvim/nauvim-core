@@ -2,6 +2,12 @@
 
 use nauvim_core::{Client, ClientId, Config, Engine, EngineEvent};
 
+mod support;
+use support::checkpoint::{
+    assert_no_markers, leave_inactive_tab, next_frame, restored_grids, revisit_inactive_tab,
+};
+use support::{is_clipboard_detection_error, isolated_config};
+
 use nvim_rpc_plugin::api;
 
 use tempfile::TempDir;
@@ -243,11 +249,7 @@ return {{
             lua_string(self.root.path().join("ssh_config").to_str().unwrap()),
             lua_string(self.root.path().join("known_hosts").to_str().unwrap())
         );
-        let file = self.root.path().join("config.lua");
-        fs::write(&file, src).unwrap();
-        let (config, ()) =
-            Config::load(Some(&file), "org.example.nauvim.ssh-test", |_| Ok(())).unwrap();
-        config
+        isolated_config(self.root.path(), &src, "org.example.nauvim.ssh-test")
     }
 
     async fn stop(mut self) {
@@ -315,6 +317,7 @@ async fn welcome(engine: &mut Engine) -> Option<String> {
         loop {
             match engine.next_event().await {
                 EngineEvent::Welcome { error } => return error,
+                EngineEvent::Error(e) if is_clipboard_detection_error(&e) => {}
                 EngineEvent::Error(error) => panic!("Unexpected remote engine error: {error}"),
                 _ => {}
             }
@@ -499,6 +502,7 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         let pid = integer(&client, "return vim.fn.getpid()").await;
         server.host_pid = Some(pid);
         wait_setup(&client, engine.client_id()).await;
+        assert_no_markers(&next_frame(&mut engine).await);
         let env = client
             .nvim()
             .request::<api::NvimExecLua, String>(("return vim.env.NAUVIM_LITERAL", ()))
@@ -529,10 +533,18 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         forwarding(&client, server.root.path(), engine.temp_dir()).await;
         #[cfg(feature = "plugin-filesystem")]
         copy(&client, server.root.path(), engine.temp_dir()).await;
+        leave_inactive_tab(&client).await;
         engine.detach().await.unwrap();
         engine.shutdown().await.unwrap();
         assert!(server.socket.exists());
         assert!(client.command("echo 'closed'").await.is_err());
+        timeout(Duration::from_secs(5), async {
+            while !server.log().contains("Nauvim detached") {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the old SSH connection did not close after detachment");
 
         let known = server.root.path().join("known_hosts");
         let original = fs::read(&known).unwrap();
@@ -556,6 +568,8 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         let client = engine.client().unwrap();
         assert_eq!(integer(&client, "return vim.fn.getpid()").await, pid);
         wait_setup(&client, engine.client_id()).await;
+        let grids = restored_grids(&mut engine).await;
+        revisit_inactive_tab(&mut engine, &client, &grids).await;
         let _ = client.command("detach").await;
         assert_eq!(
             welcome(&mut engine).await,

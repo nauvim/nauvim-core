@@ -1,6 +1,6 @@
 #![cfg(all(feature = "plugin-clipboard", target_os = "linux"))]
 
-use nauvim_core::{Client, Config, Engine, EngineEvent};
+use nauvim_core::{Client, Config, Engine, EngineEvent, HostInfo};
 
 use nvim_rpc_plugin::api;
 
@@ -45,9 +45,11 @@ impl Session {
             lua_string(root.join("clipboard host.sock").to_str().unwrap())
         );
         let file = root.join("config.lua");
-        fs::write(&file, src).unwrap();
+        fs::write(&file, &src).unwrap();
+        let mut info = HostInfo::local(Some(&file)).unwrap();
+        info.project_dirs.data_dir = root.join("data");
         let (config, ()) =
-            Config::load(Some(&file), "org.example.nauvim.clipboard-test", |_| Ok(())).unwrap();
+            Config::evaluate(&src, info, "org.example.nauvim.clipboard-test", |_| Ok(())).unwrap();
         let mut engine = Engine::new(config).unwrap();
         timeout(
             Duration::from_secs(20),

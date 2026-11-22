@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 mod info;
+pub(crate) use info::local_data_dir;
 pub use info::{HostInfo, ProjectDirs};
 mod clipboard;
 pub use clipboard::ClipboardConfig;

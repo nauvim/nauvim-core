@@ -298,6 +298,11 @@ fn present(&mut self, frame: Frame) -> Result<(), Self::Error>;
 The frontend owns presentation failures and displays them in the client UI.
 The engine does not call the backend or automatically receive its error value.
 
+When core reattaches to an owned Neovim, the first frame includes the restored
+display state updated by the new attachment's redraw. Its damage requests a
+full repaint. Pass it to the backend through the same path as any other frame.
+One-shot events come from the current attachment.
+
 ### Enabled UI extensions
 
 Core attaches with all nonlegacy UI capabilities enabled. In this version these
@@ -605,6 +610,7 @@ or on a successful WebView navigation to be visible.
 | Failure or action | Result to handle |
 | --- | --- |
 | Configuration load or validation failure | Default configuration plus error events. Invalid clipboard timeout alone uses its narrower fallback. |
+| UI checkpoint storage or restore failure | An error event. The engine starts with an empty UI model if no usable checkpoint is available. |
 | Connection-attempt failure | Returned error and normally a welcome event carrying the error; allow destination selection or retry. |
 | `EngineEvent::Error` | Client diagnostic; do not infer an attachment transition from this variant alone. |
 | Ordinary `Client` input or API error | Returned error; display it through the application. These errors are not all duplicated as engine error events. |

@@ -10,6 +10,7 @@ use crate::{ClientId, Config, Error, Frame, GridId, ResourceHandle, Transport};
 
 mod attempt;
 use attempt::Attempt;
+mod snapshot;
 
 use nvim_rpc_ui::Client as UiClient;
 
@@ -18,6 +19,7 @@ use tokio::io::WriteHalf;
 use tokio::runtime::Handle;
 use tokio::signal::unix::Signal;
 use tokio::sync::mpsc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -95,6 +97,8 @@ pub enum EngineEvent {
 
 struct Attachment {
     rpc: Connection<WriteHalf<Transport>>,
+    checkpoint_writer: Option<snapshot::Writer>,
+    attachment_guard: Option<OwnedMutexGuard<()>>,
     resources: Arc<Resources>,
     events: mpsc::UnboundedReceiver<EngineEvent>,
     setup: Option<JoinHandle<()>>,
@@ -125,6 +129,15 @@ impl Attachment {
             let _ = timeout(Duration::from_secs(2), self.rpc.detach_ui()).await;
         }
         self.rpc.stop();
+        if let Some(mut writer) = self.checkpoint_writer.take() {
+            // A terminal frame stream has committed its last checkpoint.
+            // Waiting for it does not depend on callers releasing send futures.
+            while self.rpc.recv_frame().await.is_some() {}
+            writer.finish().await;
+        }
+        // A reconnect can now restore the final committed state. The remaining
+        // cleanup still owns the previous attachment's resources and SSH link.
+        drop(self.attachment_guard.take());
         self.resources.cleanup().await;
         #[cfg(feature = "plugin-clipboard")]
         if let Err(e) = self.clipboard.shutdown().await {
@@ -162,6 +175,7 @@ pub struct Engine {
     active: Option<Attachment>,
     connecting: Option<Connecting>,
     cleanup: JoinSet<()>,
+    attachment_gate: Arc<Mutex<()>>,
     queued: VecDeque<EngineEvent>,
     pending_errors: VecDeque<String>,
     errors_tx: mpsc::UnboundedSender<String>,
@@ -209,6 +223,7 @@ impl Engine {
             active: None,
             connecting: None,
             cleanup: JoinSet::new(),
+            attachment_gate: Arc::default(),
             queued: Default::default(),
             pending_errors,
             errors_tx,
@@ -353,6 +368,7 @@ impl Engine {
             cleanup_events_tx: self.cleanup_events_tx.clone(),
             handles: Arc::clone(&self.handles),
             registry: Arc::clone(&self.registry),
+            attachment_gate: Arc::clone(&self.attachment_gate),
             active: None,
             #[cfg(feature = "plugin-clipboard")]
             clipboard: Arc::new(self.clipboard.fork()),
@@ -549,7 +565,7 @@ impl Engine {
                         None => continue,
                     }
                 }
-                frame = active.rpc.frames.recv() => {
+                frame = active.rpc.recv_frame() => {
                     match frame {
                         Some(Ok(frame)) => {
                             EngineEvent::Frame(frame)
@@ -834,7 +850,7 @@ mod tests {
         engine.install_signal().unwrap();
         let (local, _peer) = UnixStream::pair().unwrap();
         let (rdr, wtr) = split(Transport::local(local));
-        let rpc = connection::connect(
+        let (mut rpc, ui) = connection::begin(
             rdr,
             wtr,
             NoHandler,
@@ -843,6 +859,7 @@ mod tests {
             Grids::default(),
         )
         .unwrap();
+        assert!(rpc.initialize_ui(ui, None).is_none());
         let (events_tx, events) = mpsc::unbounded_channel();
         events_tx
             .send(EngineEvent::Connect {
@@ -851,6 +868,8 @@ mod tests {
             .unwrap_or_else(|_| panic!("Attachment event receiver disappeared"));
         engine.active = Some(Attachment {
             rpc,
+            checkpoint_writer: None,
+            attachment_guard: None,
             resources: Arc::new(Resources::new(
                 engine.temp_path.clone(),
                 engine.errors_tx.clone(),
@@ -965,7 +984,7 @@ mod tests {
             let mut host =
                 connect_rpc(rdr, wtr, Host(Arc::clone(&calls)), RpcOptions::default()).unwrap();
             let (rdr, wtr) = split(Transport::local(local));
-            let rpc = connection::connect(
+            let (mut rpc, ui) = connection::begin(
                 rdr,
                 wtr,
                 NoHandler,
@@ -974,9 +993,12 @@ mod tests {
                 Grids::default(),
             )
             .unwrap();
+            assert!(rpc.initialize_ui(ui, None).is_none());
             let (_, events) = mpsc::unbounded_channel();
             engine.active = Some(Attachment {
                 rpc,
+                checkpoint_writer: None,
+                attachment_guard: None,
                 resources: Arc::new(Resources::new(
                     engine.temp_path.clone(),
                     engine.errors_tx.clone(),
