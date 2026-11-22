@@ -70,3 +70,15 @@ NVIM_BIN=/absolute/path/to/nvim cargo test --all-features --test clipboard live_
 
 Report live suites separately from regular tests. A successful ignored-test
 compilation does not validate Neovim, SSH authentication, or a real clipboard.
+
+## Publishing
+
+Bump the crate version in the PR that prepares the release. After it merges, run
+[Publish nauvim-core](https://github.com/nauvim/nauvim-core/actions/workflows/publish.yml)
+from `main` with the merged PR number. The workflow publishes that PR's merge
+result. For specification updates, run it after the matching plugin PR also
+merges. The [release skill](https://github.com/nauvim/nauvim-spec/blob/main/.agents/skills/nauvim-release/SKILL.md)
+can dispatch it as part of a specification release.
+
+Configure the GitHub Actions environment `crates-io` to allow deployments from
+`main` only.
