@@ -35,7 +35,6 @@ plugin-http = [
     "dep:hyper-util",
     "dep:tokio-rustls",
     "dep:rcgen",
-    "dep:libc",
 ]
 plugin-clipboard = []
 
@@ -44,6 +43,7 @@ nvim-rpc-plugin = "0.2"
 nvim-rpc-ui = "0.1"
 mlua = { version = "0.11", features = ["lua54", "vendored", "send"] }
 directories = "6"
+libc = "0.2"
 tempfile = "3"
 tokio = { version = "1", features = [
     "rt",
@@ -79,9 +79,6 @@ rcgen = { version = "0.14", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 http-body-util = "0.1"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-libc = { version = "0.2", optional = true }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -179,12 +179,21 @@ nvim = function(host)
 end
 ```
 
-Default socket names use the client hostname, effective username, and destination
-identity. They remain stable across launches. An explicit socket setting defines
-the owned endpoint used for discovery; choose a path reserved for this client
-environment. Discovery probes only that endpoint. A refused stale socket is
-removed; an ambiguous or timed-out check fails without deleting it. Socket checks
-have a five-second timeout and attachment has a twenty-second timeout.
+When `socket` is omitted, Nauvim uses a short hashed filename in a private
+`/tmp/nauvim-sockets-<uid>` directory on the machine running Neovim. The
+directory uses the host account's effective user ID. The filename depends on
+the client hostname, client effective username, and host selection, so
+reopening Nauvim finds the same session. To reconnect to a session started with
+an older default, set `socket` to that session's path.
+
+An explicit `socket` setting selects the endpoint for discovery. Choose a path
+reserved for this client environment. If a local socket path exceeds the
+platform limit, the connection error shows the path, its length in bytes, and
+the maximum. Set that host's `socket` to a shorter path.
+
+Discovery probes only the selected endpoint. A refused stale socket is removed.
+An ambiguous or timed-out check leaves the endpoint in place. Socket checks have
+a five-second timeout and attachment has a twenty-second timeout.
 
 ## SSH configuration
 

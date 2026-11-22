@@ -79,11 +79,12 @@ pub(crate) async fn open(config: &Config, alias: &str) -> Result<(Transport, Rem
 }
 
 async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transport, Error> {
-    use crate::config::info_hash;
+    use crate::socket::{self, DIR_PREFIX, Destination};
 
     let host = config.hosts.get(alias);
-    let needs_info = host
-        .is_none_or(|h| h.nvim.needs_info() || h.socket.as_ref().is_none_or(|s| s.needs_info()));
+    let configured_socket = host.and_then(|h| h.socket.as_ref());
+    let needs_info = host.is_some_and(|h| h.nvim.needs_info())
+        || configured_socket.is_some_and(|s| s.needs_info());
     let info = if needs_info {
         Some(host_info(conn).await?)
     } else {
@@ -93,23 +94,12 @@ async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transpor
         Some(h) => h.nvim.resolve(info.as_ref(), &config.lua)?,
         None => Cow::Owned(Program::default()),
     };
-    let socket = if let Some(s) = host.and_then(|h| h.socket.as_ref()) {
+    let socket = if let Some(s) = configured_socket {
         s.resolve(info.as_ref(), &config.lua)?
     } else {
-        let host = info
-            .as_ref()
-            .ok_or_else(|| Error::Message("Missing remote host information".into()))?;
-        let local = match &config.client {
-            Some(i) => Cow::Borrowed(i),
-            None => Cow::Owned(HostInfo::local(None)?),
-        };
-        let identity = format!("{}\0{}\0{alias}", local.host_name, local.user);
-        host.project_dirs
-            .runtime_dir
-            .join("clients")
-            .join(format!("{:016x}.sock", info_hash(identity.as_bytes())))
-            .to_string_lossy()
-            .into_owned()
+        let name = socket::file_name(config.client.as_ref(), Destination::Ssh(alias))?;
+        let uid = prepare_socket_dir(conn).await?;
+        format!("{DIR_PREFIX}{uid}/{name}")
     };
     let stream = timeout(Duration::from_secs(5), check_socket(conn, &socket, &nvim))
         .await
@@ -119,13 +109,14 @@ async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transpor
     }
     // A detached shell job has no inherited channel I/O and survives SSH closure.
     // Values are positional shell arguments, never interpolated into the script.
-    let script = "socket=$1; shift; mkdir -p \"$(dirname \"$socket\")\" || exit; nohup \"$@\" </dev/null >/dev/null 2>/dev/null &";
+    let script = "if [ -n \"$1\" ]; then mkdir -p \"$(dirname \"$1\")\" || exit; fi; shift; nohup \"$@\" </dev/null >/dev/null 2>/dev/null &";
+    let create_parent = configured_socket.map_or("", |_| socket.as_str());
     let cmd = Command::new()
         .prog("sh")
         .arg("-c")
         .arg(script)
         .arg("nauvim")
-        .arg(socket.as_str())
+        .arg(create_parent)
         .arg("env")
         .arg("--")
         .args(
@@ -157,6 +148,44 @@ async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transpor
             Err(_) => sleep(Duration::from_millis(20)).await,
         }
     }
+}
+
+async fn prepare_socket_dir(conn: &Remote) -> Result<u32, Error> {
+    use crate::socket::DIR_PREFIX;
+
+    let script = r#"
+uid=$(id -u) || exit
+case $uid in ''|*[!0-9]*) exit 1;; esac
+dir=$1$uid
+if ! mkdir -m 700 "$dir" 2>/dev/null; then
+    user=$(id -un) || exit
+    if [ "$(find "$dir" -prune -type d -user "$user" -perm 0700 -print)" != "$dir" ]; then
+        printf '%s must be a directory owned by the effective user with mode 0700\n' "$dir" >&2
+        exit 1
+    fi
+fi
+printf '%s' "$uid"
+"#;
+    let output = conn
+        .exec(
+            Command::new()
+                .prog("sh")
+                .args(["-c", script, "nauvim", DIR_PREFIX])
+                .complete(false),
+        )
+        .await
+        .map_err(Error::from)?
+        .wait_with_output()
+        .await;
+    if !output.status.success() {
+        return Err(Error::Message(format!(
+            "Prepare remote Neovim socket directory: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        )));
+    }
+    let uid = String::from_utf8(output.stdout)?;
+    uid.parse()
+        .map_err(|e| Error::Message(format!("Read remote Neovim socket directory owner: {e}")))
 }
 
 async fn sftp(conn: &Remote) -> Result<SftpSession, Error> {
