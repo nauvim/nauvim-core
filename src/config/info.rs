@@ -34,14 +34,13 @@ impl HostInfo {
 
         let dirs = BaseDirs::new()
             .ok_or_else(|| Error::Message("Cannot determine home directory".into()))?;
-        let user = output("id", &["-un"])?;
-        let host_name = output("hostname", &[])?;
+        let (host_name, user) = local_identity()?;
         let runtime = env::var_os("XDG_RUNTIME_DIR")
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
             .or_else(|| dirs.runtime_dir().map(Path::to_path_buf))
             .unwrap_or_else(|| {
-                env::temp_dir().join(format!("nauvim-runtime-{}", stable_hash(user.as_bytes())))
+                env::temp_dir().join(format!("nauvim-runtime-{}", stable_hash(user.bytes())))
             });
         let cache = env::var_os("XDG_CACHE_HOME")
             .filter(|p| !p.is_empty())
@@ -121,6 +120,12 @@ impl HostInfo {
     }
 }
 
+pub(crate) fn local_identity() -> Result<(String, String), Error> {
+    let user = output("id", &["-un"])?;
+    let host_name = output("hostname", &[])?;
+    Ok((host_name, user))
+}
+
 fn output(prog: &str, args: &[&str]) -> Result<String, Error> {
     use std::process::Command;
 
@@ -195,9 +200,9 @@ pub(crate) fn resolve_path(path: &Path) -> Result<PathBuf, Error> {
     Ok(ret)
 }
 
-pub(crate) fn stable_hash(s: &[u8]) -> u64 {
-    s.iter().fold(0xcbf29ce484222325, |h, b| {
-        (h ^ u64::from(*b)).wrapping_mul(0x100000001b3)
+pub(crate) fn stable_hash(bytes: impl Iterator<Item = u8>) -> u64 {
+    bytes.fold(0xcbf29ce484222325, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     })
 }
 

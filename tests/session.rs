@@ -127,6 +127,92 @@ async fn rejects_zero_dimensions_before_startup() {
 }
 
 #[tokio::test]
+async fn reports_overlong_local_socket_paths_on_the_welcome_page() {
+    let root = tempdir().unwrap();
+    let file = root.path().join("config.lua");
+    let absolute = format!("/{}", "é".repeat(60));
+    let relative = format!("./{}", "界".repeat(40));
+    let src = format!(
+        r#"return {{hosts = {{
+            ['local "one"'] = {{nvim = 'unused', socket = {}}},
+            local_two = {{nvim = 'unused', socket = function(_) return {} end}},
+        }}}}"#,
+        lua_string(&absolute),
+        lua_string(&relative),
+    );
+    fs::write(&file, src).unwrap();
+    let (config, ()) =
+        Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
+    let mut engine = Engine::new(config).unwrap();
+
+    for (alias, path) in [(r#"local "one""#, &absolute), ("local_two", &relative)] {
+        let error = engine.connect(alias, 60, 16).await.unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("({} bytes, maximum ", path.len())),
+            "{error}"
+        );
+        assert!(
+            error.contains(&format!("Set hosts[{alias:?}].socket to a shorter path.")),
+            "{error}"
+        );
+        assert!(error.ends_with(path), "{error}");
+        let welcome = timeout(Duration::from_secs(5), async {
+            loop {
+                if let EngineEvent::Welcome { error } = engine.next_event().await {
+                    break error;
+                }
+            }
+        })
+        .await
+        .expect("connection failure did not return to the welcome page");
+        assert_eq!(welcome, Some(error));
+    }
+    engine.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_reopens_a_short_default_local_socket() {
+    let nvim = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
+    let root = tempdir().unwrap();
+    let alias = root.path().file_name().unwrap().to_str().unwrap();
+    let file = root.path().join("config.lua");
+    fs::write(
+        &file,
+        format!(
+            r#"return {{hosts = {{[{}] = {{nvim = {{prog = {}, args = {{'-u', 'NONE', '-i', 'NONE', '-n'}}}}}}}}}}"#,
+            lua_string(alias),
+            lua_string(&nvim),
+        ),
+    )
+    .unwrap();
+    let config = || {
+        Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(()))
+            .unwrap()
+            .0
+    };
+    let mut first = Engine::new(config()).unwrap();
+    first.connect(alias, 60, 16).await.unwrap();
+    let client = first.client().unwrap();
+    let process_id = pid(&client).await;
+    let address = client
+        .nvim()
+        .request::<api::NvimEval, String>(("v:servername",))
+        .await
+        .unwrap();
+    first.shutdown().await.unwrap();
+
+    let mut second = Engine::new(config()).unwrap();
+    second.connect(alias, 60, 16).await.unwrap();
+    let reattached_pid = pid(&second.client().unwrap()).await;
+    quit(&mut second).await;
+
+    assert_eq!(reattached_pid, process_id);
+    assert!(address.starts_with("/tmp/nauvim-sockets-"), "{address}");
+    assert!(address.len() <= 103, "{address}");
+}
+
+#[tokio::test]
 async fn sigterm_removes_process_temporary_directory_before_shutdown_event() {
     const MARKER: &str = "NAUVIM_SIGTERM_TEST_MARKER";
     if let Some(marker) = env::var_os(MARKER) {

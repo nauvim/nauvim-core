@@ -293,7 +293,7 @@ impl Attempt {
 
     async fn open_local(&mut self, alias: Option<&str>) -> Result<(Transport, Policies), Error> {
         use crate::HostInfo;
-        use crate::config::info_hash;
+        use crate::socket;
 
         use tokio::process::Command;
         use tokio::time::sleep;
@@ -309,40 +309,37 @@ impl Attempt {
             None => &self.config.default_spec,
         };
         let needs_info =
-            host.nvim.needs_info() || host.socket.as_ref().is_none_or(|s| s.needs_info());
+            host.nvim.needs_info() || host.socket.as_ref().is_some_and(|s| s.needs_info());
         let info = if needs_info {
             Some(HostInfo::local(None)?)
         } else {
             None
         };
         let nvim = host.nvim.resolve(info.as_ref(), &self.config.lua)?;
-        let socket = if let Some(s) = &host.socket {
+        let path = if let Some(s) = &host.socket {
             PathBuf::from(s.resolve(info.as_ref(), &self.config.lua)?)
         } else {
-            let info = info
-                .as_ref()
-                .ok_or_else(|| Error::Message("Missing local host information".into()))?;
-            let identity = format!("{}\0{}\0{}", info.host_name, info.user, alias.unwrap_or(""));
-            info.project_dirs
-                .runtime_dir
-                .join("clients")
-                .join(format!("{:016x}.sock", info_hash(identity.as_bytes())))
+            socket::local_path(info.as_ref(), alias).await?
         };
+        socket::check_local_path_length(&path, alias)?;
+
         let policies = host.policies.clone();
-        if let Some(stream) = timeout(CHECK_TIMEOUT, check_local_socket(&socket))
+        if let Some(stream) = timeout(CHECK_TIMEOUT, check_local_socket(&path))
             .await
             .map_err(|_| Error::Timeout("Socket staleness check"))??
         {
             return Ok((Transport::local(stream), policies));
         }
-        if let Some(parent) = socket.parent().filter(|p| !p.as_os_str().is_empty()) {
+        if host.socket.is_some()
+            && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())
+        {
             fs::create_dir_all(parent).await?;
         }
 
         let mut cmd = Command::new(&nvim.prog);
         cmd.args(&nvim.args)
             .args(["--headless", "--listen"])
-            .arg(&socket)
+            .arg(&path)
             .envs(&nvim.env)
             .env("NAUVIM_CONNECTION", "local")
             .stdin(Stdio::null())
@@ -358,7 +355,7 @@ impl Attempt {
                     "Neovim exited during startup ({status})"
                 )));
             }
-            match UnixStream::connect(&socket).await {
+            match UnixStream::connect(&path).await {
                 Ok(stream) => {
                     // Dropping this non-killing handle delegates child reaping to
                     // Tokio; the persistent host remains independent of the UI.

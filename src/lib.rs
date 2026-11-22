@@ -57,6 +57,7 @@ pub use resources::WebviewWindow;
 mod transport;
 pub use transport::Transport;
 mod dispatch;
+mod socket;
 #[cfg(feature = "ssh")]
 mod ssh;
 

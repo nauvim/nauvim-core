@@ -396,7 +396,7 @@ fn validate_disabled_ssh(t: Option<&Table>) -> Result<(), Error> {
     Ok(())
 }
 
-pub(crate) use info::stable_hash as info_hash;
+pub(crate) use info::{local_identity, stable_hash};
 
 fn fields(t: &Table, accepted: &[&str], context: &str) -> Result<(), Error> {
     for pair in t.clone().pairs::<Value, Value>() {
