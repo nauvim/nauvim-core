@@ -592,20 +592,27 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
     use std::str;
 
     let root = tempdir().unwrap();
-    let file = root.path().join("init.lua");
+    let file = root.path().join("config.lua");
+    let init = root.path().join("init.lua");
     let socket = root.path().join("literal ' socket.sock");
     let record = root.path().join("argv record");
     let bin = env::var("NVIM_BIN").expect("Set NVIM_BIN");
     let script = r#"printf '%s\0' "$@" > "$NAUVIM_ARGV_FILE"; exec "$@""#;
     let literal = "literal $HOME; 'quoted' \"double\" 日本語";
+    fs::write(
+        &init,
+        "vim.g.nauvim_test_connection = os.getenv('NAUVIM_CONNECTION')",
+    )
+    .unwrap();
     let src = format!(
         r#"return {{hosts = {{local_host = {{
-        nvim = {{prog = "sh", args = {{"-c", {}, "nauvim", {}, "-u", "NONE", "-i", "NONE", "-n", "-O3"}},
-            env = {{NAUVIM_ARGV_FILE = {}, NAUVIM_LITERAL = {}}}}},
+        nvim = {{prog = "sh", args = {{"-c", {}, "nauvim", {}, "-u", {}, "-i", "NONE", "-n", "-O3"}},
+            env = {{NAUVIM_ARGV_FILE = {}, NAUVIM_LITERAL = {}, NAUVIM_CONNECTION = "configured"}}}},
         socket = {},
     }}}}}}"#,
         lua_string(script),
         lua_string(&bin),
+        lua_string(init.to_str().unwrap()),
         lua_string(record.to_str().unwrap()),
         lua_string(literal),
         lua_string(socket.to_str().unwrap())
@@ -622,6 +629,11 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
         .await
         .unwrap();
     assert_eq!(value, literal);
+    assert!(
+        lua_bool(&client, "return vim.g.nauvim_test_connection == 'local'").await,
+        "local init.lua must see the launch marker through the wrapper"
+    );
+
     let recorded = fs::read(&record).unwrap();
     let actual: Vec<_> = recorded
         .split(|&b| b == 0)
@@ -633,7 +645,7 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
         [
             bin.as_str(),
             "-u",
-            "NONE",
+            init.to_str().unwrap(),
             "-i",
             "NONE",
             "-n",

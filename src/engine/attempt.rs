@@ -94,7 +94,7 @@ impl Attempt {
                     .config
                     .hosts
                     .get(alias)
-                    .map(|h| h.policies)
+                    .map(|h| h.policies.clone())
                     .unwrap_or_default();
                 (transport, policies, Some(remote))
             }
@@ -172,8 +172,6 @@ impl Attempt {
             host_detach,
             #[cfg(feature = "plugin-clipboard")]
             clipboard: Arc::clone(&self.clipboard),
-            #[cfg(feature = "plugin-clipboard")]
-            clipboard_enabled: _policies.clipboard,
             #[cfg(feature = "ssh")]
             remote: _remote,
         });
@@ -330,7 +328,7 @@ impl Attempt {
                 .join("clients")
                 .join(format!("{:016x}.sock", info_hash(identity.as_bytes())))
         };
-        let policies = host.policies;
+        let policies = host.policies.clone();
         if let Some(stream) = timeout(CHECK_TIMEOUT, check_local_socket(&socket))
             .await
             .map_err(|_| Error::Timeout("Socket staleness check"))??
@@ -346,6 +344,7 @@ impl Attempt {
             .args(["--headless", "--listen"])
             .arg(&socket)
             .envs(&nvim.env)
+            .env("NAUVIM_CONNECTION", "local")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

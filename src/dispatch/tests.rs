@@ -38,12 +38,7 @@ fn dispatch(client_id: u32) -> (Dispatch, mpsc::UnboundedReceiver<EngineEvent>, 
                 feature = "plugin-http",
                 feature = "plugin-clipboard"
             ))]
-            policies: Policies {
-                local_forward: false,
-                filesystem: false,
-                http: false,
-                clipboard: false,
-            },
+            policies: Policies::default(),
             #[cfg(feature = "plugin-clipboard")]
             clipboard: Arc::default(),
             #[cfg(feature = "plugin-clipboard")]
@@ -73,6 +68,18 @@ fn arguments(value: impl Primitive) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.write_primitive(value).consume();
     bytes
+}
+
+#[cfg(any(
+    feature = "plugin-local-forward",
+    feature = "plugin-filesystem",
+    feature = "plugin-http"
+))]
+fn policies(source: &str) -> Policies {
+    use mlua::Lua;
+
+    let lua = Lua::new();
+    Policies::parse(Some(lua.load(source).eval().unwrap())).unwrap()
 }
 
 #[tokio::test]
@@ -118,6 +125,7 @@ async fn ignores_invalid_client_ids_before_method_policy_and_argument_validation
             "nauvim-plugin/local-forward.clear",
             "nauvim-plugin/filesystem.clear",
             "nauvim-plugin/http.clear",
+            "nauvim-plugin/http.focus_webview",
             "nauvim-plugin/unknown",
         ] {
             assert!(
@@ -156,7 +164,7 @@ async fn reports_copy_notification_backend_errors_without_an_rpc_response() {
     let (errors, mut reports) = mpsc::unbounded_channel();
     dispatch.clipboard_errors = errors;
     unavailable_clipboard(&mut dispatch);
-    dispatch.policies.clipboard = true;
+    dispatch.policies.clipboard_copy = true;
     for (register, text) in [("+", ""), ("*", "日本語🙂\nsecond"), ("+", "line\n")] {
         for input in [
             arguments((7, register, text)),
@@ -197,7 +205,7 @@ fn unavailable_clipboard(dispatch: &mut Dispatch) {
 async fn validates_copy_notification_arguments_before_backend_access() {
     let (mut dispatch, mut events, _dir) = dispatch(7);
     unavailable_clipboard(&mut dispatch);
-    dispatch.policies.clipboard = true;
+    dispatch.policies.clipboard_copy = true;
     let invalid = [
         (arguments((7,)), "Missing RPC argument"),
         (arguments((7, "+")), "Missing RPC argument"),
@@ -274,15 +282,49 @@ async fn validates_copy_client_id_and_policy_before_backend_access() {
             .await
             .unwrap();
     }
-    let error = dispatch
-        .notification(
-            b"nauvim-plugin/clipboard.copy",
-            params(&arguments((7, "+", "text"))),
-        )
-        .await
-        .unwrap_err();
-    assert_eq!(error, "Client policy denies this operation");
     assert!(events.try_recv().is_err());
+
+    use nvim_rpc_plugin::{ConnectionOptions, connect};
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, duplex, split};
+    use tokio::time::{Duration, timeout};
+
+    let (mut host, client) = duplex(256);
+    let (rdr, wtr) = split(client);
+    let mut rpc = connect(rdr, wtr, dispatch, ConnectionOptions::default()).unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        host.write_all(&arguments((
+            2,
+            "nauvim-plugin/clipboard.copy",
+            (7, "+", "text"),
+        )))
+        .await
+        .unwrap();
+        let Some(EngineEvent::Error(error)) = events.recv().await else {
+            panic!("Expected a policy denial event");
+        };
+        assert_eq!(error, "Client policy denies this operation");
+
+        host.write_all(&arguments((
+            0,
+            42,
+            "nauvim-plugin/client.host_detach",
+            (7,),
+        )))
+        .await
+        .unwrap();
+        let mut reply = [0; 5];
+        host.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, [0x94, 1, 42, 0xc0, 0xc0]);
+        rpc.stop();
+        rpc.wait().await.unwrap();
+        let mut trailing = Vec::new();
+        host.read_to_end(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty());
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -316,7 +358,13 @@ async fn rejects_invalid_operation_types_and_ranges_before_allocating_resources(
     use std::fs::read_dir;
 
     let (mut dispatch, mut events, dir) = dispatch(7);
-    dispatch.policies = Policies::default();
+    dispatch.policies = policies(
+        "return {plugin = {
+            local_forward = {tcp = 'all', socket = 'all'},
+            filesystem = {copy = true},
+            http = {serve_file = true},
+        }}",
+    );
     #[cfg(feature = "plugin-http")]
     std::fs::write(dir.path().join("file"), b"fixture").unwrap();
     let cases = [
@@ -422,6 +470,148 @@ async fn rejects_invalid_operation_types_and_ranges_before_allocating_resources(
     dispatch.resources.cleanup().await;
 }
 
+#[cfg(any(
+    feature = "plugin-local-forward",
+    feature = "plugin-filesystem",
+    feature = "plugin-http"
+))]
+#[tokio::test]
+async fn denies_plugin_requests_without_allocating_handles_by_default() {
+    #[cfg(feature = "plugin-http")]
+    use nvim_rpc_plugin::mp::encode::primitive::Map;
+
+    let (dispatch, mut events, _dir) = dispatch(7);
+    let requests = [
+        #[cfg(feature = "plugin-local-forward")]
+        ("local-forward.open_tcp", arguments((7, 0, "localhost", 80))),
+        #[cfg(feature = "plugin-local-forward")]
+        (
+            "local-forward.open_socket",
+            arguments((7, "client.sock", "/host.sock")),
+        ),
+        #[cfg(feature = "plugin-filesystem")]
+        ("filesystem.copy", arguments((7, "client", "/host", false))),
+        #[cfg(feature = "plugin-http")]
+        ("http.serve_file", arguments((7, "file", 0, false, false))),
+        #[cfg(feature = "plugin-http")]
+        (
+            "http.open_webview",
+            arguments((
+                7,
+                "https://example.test/",
+                Map([
+                    ("grid", 1),
+                    ("top", 0),
+                    ("left", 0),
+                    ("height", 1),
+                    ("width", 1),
+                ]),
+                Nil,
+                Nil,
+            )),
+        ),
+    ];
+    for (method, args) in requests {
+        let method = format!("nauvim-plugin/{method}");
+        let error = dispatch
+            .request(method.as_bytes(), params(&args))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "Client policy denies this operation", "{method}");
+    }
+    assert_eq!(dispatch.resources.reserve().await.unwrap().get(), 1);
+    assert!(events.try_recv().is_err());
+    dispatch.resources.cleanup().await;
+}
+
+#[cfg(feature = "plugin-local-forward")]
+#[tokio::test]
+async fn matches_forwarding_endpoints_and_preserves_handle_operations() {
+    use std::os::unix::fs::symlink;
+
+    let (mut dispatch, mut events, dir) = dispatch(7);
+    dispatch.policies = policies(
+        r#"return {plugin = {local_forward = {
+            tcp = {{client_port = 0, host_addr = "localhost", host_port = 80}},
+            socket = {{client_socket_path = "nested/client.sock", host_socket_path = "/run/host.sock"}},
+        }}}"#,
+    );
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    symlink("nested", dir.path().join("link")).unwrap();
+
+    for args in [
+        arguments((7, 1, "localhost", 80)),
+        arguments((7, 0, "LOCALHOST", 80)),
+        arguments((7, 0, "localhost", 81)),
+    ] {
+        let error = dispatch
+            .request(b"nauvim-plugin/local-forward.open_tcp", params(&args))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "Client policy denies this operation");
+    }
+    for args in [
+        arguments((7, "link/other.sock", "/run/host.sock")),
+        arguments((7, "link/client.sock", "/run/./host.sock")),
+    ] {
+        let error = dispatch
+            .request(b"nauvim-plugin/local-forward.open_socket", params(&args))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "Client policy denies this operation");
+    }
+
+    let tcp = dispatch
+        .request(
+            b"nauvim-plugin/local-forward.open_tcp",
+            params(&arguments((7, 0, "localhost", 80))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(encoded(tcp), b"\x01");
+    let socket = dispatch
+        .request(
+            b"nauvim-plugin/local-forward.open_socket",
+            params(&arguments((7, "///link/./client.sock", "/run/host.sock"))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(encoded(socket), b"\x02");
+
+    dispatch.policies = Policies::default();
+    let port = dispatch
+        .resources
+        .get_port(1.into())
+        .await
+        .unwrap()
+        .unwrap();
+    let reply = dispatch
+        .request(
+            b"nauvim-plugin/local-forward.get_port",
+            params(&arguments((7, 1))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(encoded(reply), arguments(i64::from(port)));
+
+    for handle in [1, 2] {
+        dispatch
+            .notification(
+                b"nauvim-plugin/local-forward.clear",
+                params(&arguments((7, handle))),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(dispatch.resources.get_port(1.into()).await.is_err());
+    assert!(!dir.path().join("nested/client.sock").exists());
+    assert!(events.try_recv().is_err());
+    dispatch.resources.cleanup().await;
+}
+
 #[tokio::test]
 async fn validates_notification_host_and_handle_types_before_operations() {
     let (dispatch, mut events, _dir) = dispatch(7);
@@ -448,6 +638,8 @@ async fn validates_notification_host_and_handle_types_before_operations() {
         "nauvim-plugin/filesystem.clear",
         #[cfg(feature = "plugin-http")]
         "nauvim-plugin/http.clear",
+        #[cfg(feature = "plugin-http")]
+        "nauvim-plugin/http.focus_webview",
     ];
     for method in methods {
         for input in [
@@ -495,7 +687,9 @@ async fn validates_webview_dictionary_fields_before_allocating_a_handle() {
     }
 
     let (mut dispatch, mut events, _dir) = dispatch(7);
-    dispatch.policies.http = true;
+    dispatch.policies = policies(
+        "return {plugin = {http = {open_webview = {origins = {'https://example.test'}}}}}",
+    );
     for field in ["top", "left", "height", "width"] {
         for input in [
             position(field, -1),
@@ -575,6 +769,196 @@ async fn validates_webview_dictionary_fields_before_allocating_a_handle() {
         events.try_recv().is_err(),
         "A missing grid must not create a window"
     );
+    dispatch
+        .notification(b"nauvim-plugin/http.clear", params(&arguments((7, 2))))
+        .await
+        .unwrap();
+    assert!(events.try_recv().is_err());
+    dispatch.resources.cleanup().await;
+}
+
+#[cfg(feature = "plugin-http")]
+#[tokio::test]
+async fn checks_webview_origins_and_focus_for_open_windows() {
+    use crate::GridId;
+
+    use nvim_rpc_plugin::mp::encode::primitive::Map;
+
+    let (mut dispatch, mut events, dir) = dispatch(7);
+    let (errors, mut reports) = mpsc::unbounded_channel();
+    dispatch.resources = Arc::new(Resources::new(dir.path().to_owned(), errors));
+    dispatch.grids.write().unwrap().insert(GridId(1));
+    dispatch.policies = policies(
+        "return {plugin = {http = {open_webview = {origins = {'https://example.test'}}}}}",
+    );
+    let method = b"nauvim-plugin/http.open_webview";
+    let focus_method = b"nauvim-plugin/http.focus_webview";
+    let position = || {
+        Map([
+            ("grid", 1),
+            ("top", 0),
+            ("left", 0),
+            ("height", 1),
+            ("width", 1),
+        ])
+    };
+    let url = "https://EXAMPLE.test:443/page#section";
+
+    for denied in [
+        "http://example.test",
+        "https://example.test:444",
+        "https://other.test",
+    ] {
+        let error = dispatch
+            .request(
+                method,
+                params(&arguments((7, denied, position(), Nil, Nil))),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error, "Client policy denies this operation");
+    }
+    for input in [
+        arguments((7, url, position(), 1, Nil)),
+        arguments((7, url, position(), Nil, "true")),
+        arguments((7, url, position(), true, false, Nil)),
+    ] {
+        assert!(dispatch.request(method, params(&input)).await.is_err());
+    }
+    assert!(events.try_recv().is_err());
+
+    for (idx, (args, expected)) in [
+        (arguments((7, url, position(), Nil, Nil)), (true, true)),
+        (arguments((7, url, position(), false, Nil)), (false, true)),
+        (arguments((7, url, position(), true, false)), (true, false)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = i64::try_from(idx + 1).unwrap();
+        let ret = dispatch.request(method, params(&args)).await.unwrap();
+        assert_eq!(encoded(ret), arguments(id));
+        let EngineEvent::OpenWebview {
+            handle,
+            url: opened_url,
+            focus,
+            focusable,
+            window,
+            ..
+        } = events.try_recv().unwrap()
+        else {
+            panic!("Expected an open event");
+        };
+        assert_eq!(handle.get(), id);
+        assert_eq!(opened_url, url);
+        assert_eq!((focus, focusable), expected);
+
+        let args = arguments((7, id));
+        dispatch
+            .notification(focus_method, params(&args))
+            .await
+            .unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "Pending windows cannot receive focus"
+        );
+        assert!(window.allows_navigation(url));
+        assert!(window.opened());
+        assert!(window.allows_navigation("https://example.test/redirected"));
+        assert!(!window.allows_navigation("https://other.test/redirected"));
+        assert!(reports.try_recv().unwrap().contains("Client policy denies"));
+
+        dispatch
+            .notification(focus_method, params(&args))
+            .await
+            .unwrap();
+        if focusable {
+            assert!(matches!(
+                events.try_recv().unwrap(),
+                EngineEvent::FocusWebview { handle: focused } if focused == handle
+            ));
+            window.report_error("fixture focus failure");
+            assert_eq!(reports.try_recv().unwrap(), "fixture focus failure");
+            assert!(window.can_focus(), "Focus failure leaves the window open");
+        }
+        assert!(events.try_recv().is_err());
+        window.closed();
+        dispatch
+            .notification(focus_method, params(&args))
+            .await
+            .unwrap();
+        assert!(
+            events.try_recv().is_err(),
+            "Closed windows cannot receive focus"
+        );
+    }
+
+    dispatch
+        .notification(focus_method, params(&arguments((7, 999))))
+        .await
+        .unwrap();
+    assert!(events.try_recv().is_err(), "Unknown handles have no effect");
+    dispatch.resources.cleanup().await;
+}
+
+#[cfg(feature = "plugin-http")]
+#[tokio::test]
+async fn allows_webviews_for_active_file_servers_on_the_receiving_attachment() {
+    use nvim_rpc_plugin::mp::encode::primitive::Map;
+
+    let (mut dispatch, mut events, dir) = dispatch(7);
+    dispatch.policies =
+        policies("return {plugin = {http = {open_webview = {served_files = true}}}}");
+    std::fs::write(dir.path().join("file"), b"fixture").unwrap();
+    let server = dispatch
+        .resources
+        .serve_file("file".into(), 0, false, false)
+        .await
+        .unwrap();
+    let port = dispatch
+        .resources
+        .get_http_port(server)
+        .await
+        .unwrap()
+        .unwrap();
+    let ret = dispatch
+        .request(
+            b"nauvim-plugin/http.get_port",
+            params(&arguments((7, server.get()))),
+        )
+        .await
+        .unwrap();
+    assert_eq!(encoded(ret), arguments(i64::from(port)));
+
+    let url = format!("http://127.0.0.1:{port}/file");
+    let args = arguments((
+        7,
+        url.as_str(),
+        Map([
+            ("grid", 1),
+            ("top", 0),
+            ("left", 0),
+            ("height", 1),
+            ("width", 1),
+        ]),
+        Nil,
+        Nil,
+    ));
+    let method = b"nauvim-plugin/http.open_webview";
+    let ret = dispatch.request(method, params(&args)).await.unwrap();
+    assert_eq!(encoded(ret), b"\x02");
+
+    dispatch
+        .notification(
+            b"nauvim-plugin/http.clear",
+            params(&arguments((7, server.get()))),
+        )
+        .await
+        .unwrap();
+    let error = dispatch.request(method, params(&args)).await.err().unwrap();
+    assert_eq!(error, "Client policy denies this operation");
+    assert!(events.try_recv().is_err());
     dispatch.resources.cleanup().await;
 }
 

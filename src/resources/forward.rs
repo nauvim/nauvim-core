@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 
 use std::io::ErrorKind;
 use std::net::Ipv4Addr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -21,10 +22,23 @@ impl Resources {
         host_addr: String,
         host_port: u16,
     ) -> Result<ResourceHandle, String> {
+        self.open_tcp_checked(client_port, host_addr, host_port, |_, _, _| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn open_tcp_checked(
+        &self,
+        client_port: u16,
+        host_addr: String,
+        host_port: u16,
+        check: impl FnOnce(u16, &str, u16) -> Result<(), String>,
+    ) -> Result<ResourceHandle, String> {
         path::valid_string(&host_addr)?;
         if host_port == 0 {
             return Err("Host TCP port must be between 1 and 65535".to_owned());
         }
+        check(client_port, &host_addr, host_port)?;
+
         let (binding, outcome) = watch::channel(Binding::Pending);
         let mut resource = Resource::new(Data::Tcp(outcome), &self.stop, &self.owner);
         let stop = resource.stop.clone();
@@ -116,8 +130,23 @@ impl Resources {
         client_socket_path: String,
         host_socket_path: String,
     ) -> Result<ResourceHandle, String> {
+        self.open_socket_checked(client_socket_path, host_socket_path, |_, _| Ok(()))
+            .await
+    }
+
+    pub(crate) async fn open_socket_checked(
+        &self,
+        client_socket_path: String,
+        host_socket_path: String,
+        check: impl FnOnce(&Path, &str) -> Result<(), String>,
+    ) -> Result<ResourceHandle, String> {
         path::valid_string(&host_socket_path)?;
-        let path = self.client_path(&client_socket_path)?;
+        let (path, base) = self.client_path_with_base(&client_socket_path)?;
+        let relative = path
+            .strip_prefix(&base)
+            .map_err(|e| format!("Resolve path relative to process temporary directory: {e}"))?;
+        check(relative, &host_socket_path)?;
+
         let bound = Arc::new(AtomicBool::new(false));
         let mut resource = Resource::new(
             Data::Socket {

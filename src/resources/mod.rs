@@ -8,6 +8,8 @@ mod copy;
 mod forward;
 #[cfg(feature = "plugin-http")]
 mod http;
+#[cfg(feature = "plugin-http")]
+pub use http::WebviewWindow;
 mod path;
 
 #[cfg(feature = "ssh")]
@@ -31,6 +33,8 @@ use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(feature = "plugin-http")]
+use std::sync::Weak;
 #[cfg(any(feature = "plugin-filesystem", feature = "plugin-local-forward"))]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -91,10 +95,14 @@ enum Kind {
     Copy,
     #[cfg(feature = "plugin-http")]
     Http,
+    #[cfg(feature = "plugin-http")]
+    Webview,
 }
 
 enum Data {
     Reserved,
+    #[cfg(feature = "plugin-http")]
+    Webview(Weak<http::Window>),
     #[cfg(feature = "plugin-local-forward")]
     Tcp(watch::Receiver<Binding>),
     #[cfg(feature = "plugin-local-forward")]
@@ -123,6 +131,8 @@ impl Data {
     fn kind(&self) -> Kind {
         match self {
             Self::Reserved => Kind::Reserved,
+            #[cfg(feature = "plugin-http")]
+            Self::Webview(_) => Kind::Webview,
             #[cfg(feature = "plugin-local-forward")]
             Self::Tcp(_) => Kind::Tcp,
             #[cfg(feature = "plugin-local-forward")]
@@ -205,6 +215,8 @@ pub struct Resources {
     owner: Arc<()>,
     stop: CancellationToken,
     handles: Arc<AtomicI64>,
+    #[cfg(feature = "plugin-http")]
+    served_origins: Arc<http::ServedOrigins>,
     #[cfg(feature = "ssh")]
     remote: Option<Remote>,
 }
@@ -236,6 +248,8 @@ impl Resources {
             owner: Arc::new(()),
             stop: CancellationToken::new(),
             handles,
+            #[cfg(feature = "plugin-http")]
+            served_origins: Arc::default(),
             #[cfg(feature = "ssh")]
             remote: None,
         }
@@ -320,12 +334,22 @@ impl Resources {
         }
     }
 
+    #[cfg(any(feature = "plugin-local-forward", feature = "plugin-filesystem"))]
+    async fn take(&self, handle: ResourceHandle, kinds: &[Kind]) -> Option<Resource> {
+        self.take_if(handle, kinds, |_| true).await
+    }
+
     #[cfg(any(
         feature = "plugin-local-forward",
         feature = "plugin-filesystem",
         feature = "plugin-http"
     ))]
-    async fn take(&self, handle: ResourceHandle, kinds: &[Kind]) -> Option<Resource> {
+    async fn take_if(
+        &self,
+        handle: ResourceHandle,
+        kinds: &[Kind],
+        matches: impl FnOnce(&Resource) -> bool,
+    ) -> Option<Resource> {
         let mut state = self.registry.state.lock().await;
         if state.entries.get(&handle).is_some_and(|resource| {
             kinds.contains(&resource.data.kind())
@@ -333,6 +357,7 @@ impl Resources {
                     .data
                     .path()
                     .is_none_or(|target| path::descendant(&self.base, target).is_ok())
+                && matches(resource)
         }) {
             state.entries.remove(&handle)
         } else {
@@ -431,9 +456,13 @@ impl Resources {
     /// Leading slashes are ignored. Symbolic links and relative components are
     /// resolved in filesystem order; missing descendant entries are permitted.
     pub fn client_path(&self, path: &str) -> Result<PathBuf, String> {
+        self.client_path_with_base(path).map(|(path, _)| path)
+    }
+
+    fn client_path_with_base(&self, path: &str) -> Result<(PathBuf, PathBuf), String> {
         path::valid_string(path)?;
         let target = self.base.join(path.trim_start_matches('/'));
-        path::descendant(&self.base, &target)
+        path::descendant_with_base(&self.base, &target)
             .map_err(|e| format!("Resolve client path {}: {e}", target.display()))
     }
 }
@@ -667,13 +696,29 @@ mod tests {
             registry.clone(),
         );
         let new = Resources::with_registry(dir.path().to_owned(), errors, handles, registry);
-        let earlier = old.reserve().await.unwrap();
-        let current = new.reserve().await.unwrap();
-        assert_eq!(old.windows().await, [earlier]);
+        let (earlier, earlier_window) = old
+            .reserve_webview(old.webview_navigation(Default::default()), true)
+            .await
+            .unwrap();
+        let (current, current_window) = new
+            .reserve_webview(new.webview_navigation(Default::default()), true)
+            .await
+            .unwrap();
+        let (pending, pending_window) = old
+            .reserve_webview(old.webview_navigation(Default::default()), true)
+            .await
+            .unwrap();
+        assert!(earlier_window.opened());
+        assert!(current_window.opened());
+        assert_eq!(old.windows().await, [earlier, pending]);
         assert_eq!(new.windows().await, [current]);
+        assert!(!new.clear_http(pending).await);
+        assert!(new.can_focus_webview(earlier).await);
         assert!(new.clear_http(earlier).await);
-        assert!(old.windows().await.is_empty());
+        assert!(!earlier_window.can_focus());
+        assert_eq!(old.windows().await, [pending]);
         old.cleanup().await;
+        assert!(!pending_window.opened());
         assert_eq!(new.windows().await, [current]);
         assert!(old.clear_http(current).await);
         assert!(new.windows().await.is_empty());

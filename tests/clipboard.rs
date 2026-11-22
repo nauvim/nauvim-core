@@ -31,12 +31,13 @@ struct Session {
 }
 
 impl Session {
-    async fn open(root: &Path) -> Self {
+    async fn open(root: &Path, allow_copy: bool) -> Self {
         let nvim = env::var("NVIM_BIN").expect("Set NVIM_BIN to Neovim v0.12.6");
         let startup = "lua package.preload['nauvim-plugin.client']=function() return {setup=function(opts) _G.nauvim_clipboard_setup=opts.client_id end} end";
         let src = format!(
             r#"return {{clipboard="xclip",hosts={{local_host={{
             nvim={{prog={},args={{"-u","NONE","-i","NONE","-n","--cmd",{}}},env={{NVIM_LOG_FILE={}}}}},socket={},
+            policies={{plugin={{clipboard={{copy={allow_copy}}}}}}},
         }}}}}}"#,
             lua_string(&nvim),
             lua_string(startup),
@@ -196,7 +197,7 @@ async fn isolated_notifications_validate_text_and_gui_paste_uses_native_input() 
     const ROOT: &str = "NAUVIM_CLIPBOARD_TEST_DIR";
     if let Some(root) = env::var_os(ROOT) {
         let root = Path::new(&root);
-        let mut session = Session::open(root).await;
+        let mut session = Session::open(root, true).await;
 
         for (register, selection) in [("+", "clipboard"), ("*", "primary")] {
             for text in [
@@ -351,6 +352,26 @@ async fn isolated_notifications_validate_text_and_gui_paste_uses_native_input() 
         for pid in owners {
             assert!(!Path::new(&format!("/proc/{}", pid.trim())).exists());
         }
+
+        fs::remove_file(root.join("read-fail")).unwrap();
+        let mut session = Session::open(root, false).await;
+        let id = session.engine.client_id();
+        session
+            .notify(&format!("{id}, '+', 'discard this copy'"))
+            .await;
+        assert_eq!(session.error().await, "Client policy denies this operation");
+        assert_eq!(fs::read(root.join("writes")).unwrap(), writes);
+        assert_eq!(fs::read(root.join("clipboard")).unwrap(), text.as_bytes());
+
+        assert!(
+            session
+                .lua(
+                    "vim.paste=function(lines, phase) return lines[2] == 'literal<Esc>' and phase == -1 end; return true"
+                )
+                .await
+        );
+        assert!(session.engine.paste().await.unwrap());
+        session.close().await;
         return;
     }
 
@@ -456,7 +477,7 @@ async fn live_copy_notifications_and_gui_paste_use_the_desktop_clipboard() {
         ("primary", raw("primary").await),
     ]);
     let root = tempdir().unwrap();
-    let session = Session::open(root.path()).await;
+    let session = Session::open(root.path(), true).await;
 
     for (register, selection) in [("+", "clipboard"), ("*", "primary")] {
         for text in ["日本語🙂\n終端\n", "literal<Esc>\n", "ab\n日本"] {

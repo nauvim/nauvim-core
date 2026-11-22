@@ -232,12 +232,13 @@ actions.
 | `Welcome { error }` | Show destination selection, reset attachment-specific rendering and input state, and display the optional error. Keep receiving events. |
 | `Connect { host }` | Show the destination or connection progress. Continue receiving events; the engine performs this switch. |
 | `Error(message)` | Display a client error. This event alone does not end an attachment. |
-| `OpenWebview { handle, url, position }` | Begin creating the requested GUI presentation, keyed by the resource handle. |
+| `OpenWebview` | Begin creating the requested GUI window and retain its `WebviewWindow` by resource handle. |
+| `FocusWebview { handle }` | Focus the window if it is still open and focusable. |
 | `CloseWebview { handle }` | Close that presentation if it exists; tolerate a handle with no local window. |
 | `Shutdown` | Finish application finalization, including an awaited `shutdown()`, then exit. |
 
-The following is a **partial dispatcher**, inside an existing asynchronous
-application driver. `ui` is your adapter: `present()` delegates to its `Backend`
+The following is a **partial dispatcher** inside an asynchronous application
+driver built with `plugin-http`. `ui` is your adapter. Its `present()` delegates to its `Backend`
 and displays presentation failures; the other methods update toolkit state or
 start window work. They do not await navigation or perform long-running work.
 The surrounding driver also handles application commands and final shutdown.
@@ -251,9 +252,10 @@ loop {
         EngineEvent::Welcome { error } => ui.show_welcome(error),
         EngineEvent::Connect { host } => ui.show_connecting(host),
         EngineEvent::Error(message) => ui.show_error(message),
-        EngineEvent::OpenWebview { handle, url, position } => {
-            ui.open_webview(handle, url, position);
+        EngineEvent::OpenWebview { handle, url, position, focus, focusable, window } => {
+            ui.open_webview(handle, url, position, focus, focusable, window);
         }
+        EngineEvent::FocusWebview { handle } => ui.focus_webview(handle),
         EngineEvent::CloseWebview { handle } => ui.close_webview(handle),
         EngineEvent::Shutdown => break,
     }
@@ -470,12 +472,11 @@ completion belong to the surrounding driver. A host switch does not redirect
 that pending paste to the new attachment.
 
 `Ok(true)` means Neovim accepted the paste; `Ok(false)` means its paste handler
-cancelled it. CR, LF, and CRLF become line breaks. Failures, including missing
-attachments and denied clipboard policies, both return an error and emit
-`EngineEvent::Error`. Select one error-display path to avoid duplicate messages.
+cancelled it. CR, LF, and CRLF become line breaks. Failures return an error
+and emit `EngineEvent::Error`. Select one error-display path to avoid duplicate
+messages.
 `Client::paste(text)` is the lower-level operation for text the caller already
-has; it does not read the desktop clipboard or apply the engine's clipboard
-policy.
+has.
 
 ## Plugin windows and client resources
 
@@ -486,33 +487,36 @@ the host when offering its features. The specification supports the latest core
 and plugin together; other combinations have no specified compatibility.
 
 Forwarding, copies, HTTP servers, plugin validation, and their resource handles
-are managed by core. Your UI does not need to duplicate the plugin RPC dispatcher
-or implement an SSH or clipboard transport. Host-specific policies are enforced
-by core; see [configuration](usage.md#loading-configuration) for the current
-policy format.
+are managed by core. Core enforces
+[host plugin permissions](usage.md#host-plugin-permissions) when a plugin
+requests an operation. The frontend calls core's navigation check for each
+top-level target.
 
 ### Opening and closing presentations
 
-With `plugin-http`, `OpenWebview` asks your application to begin creating a GUI
-window and access an HTTP(S) URL through it. A WebView is one possible component;
-another component is allowed if it provides the required URL access. Creation
-and navigation are asynchronous. Display their failures in the client UI.
-The event API has no success acknowledgment or method for returning a later
-window-creation error to the original plugin RPC.
+With `plugin-http`, `OpenWebview` asks the frontend to create a GUI window
+asynchronously and load an HTTP(S) URL. Keep the window and its `WebviewWindow`
+registration by `ResourceHandle`.
 
-Maintain window and pending-creation records keyed by `ResourceHandle`.
-`CloseWebview` closes an existing presentation. Closing an already closed or
-unknown handle must be harmless: core can reserve a handle for a request
-targeting a nonexistent grid without emitting `OpenWebview`, and clearing that
-handle can still emit `CloseWebview`.
+1. Install `WebviewWindow::allows_navigation()` as a check before loading the
+   initial URL. Apply it before accessing each top-level navigation target,
+   including every redirect. Block the target when the check returns `false`.
+   Core checks the opening attachment's policy and reports a denial through
+   `EngineEvent::Error`.
+2. Apply `focusable` to the toolkit window. Call `WebviewWindow::opened()` when
+   the window exists. If it returns `false`, dispose of the window. Otherwise,
+   focus it immediately if both `focus` and `focusable` are true.
+3. On `FocusWebview`, find the window by handle and recheck
+   `WebviewWindow::can_focus()` before moving focus. If moving focus fails,
+   call `WebviewWindow::report_error()` and leave the window open. Use the same
+   reporting method for creation or load failures.
+4. On `CloseWebview`, close the presentation or cancel outstanding creation
+   for that handle. Handle closure idempotently. Call `WebviewWindow::closed()`
+   when the toolkit closes the window or creation fails.
 
-The specification gives an explicit HTTP clear operation no effect when its
-requested GUI window does not yet exist. Attachment cleanup also needs to stop
-pending GUI creation and discard late completions from the old attachment.
-The close event carries no reason, and core receives no window-creation
-acknowledgment. Track pending work in your adapter and use attachment lifecycle
-transitions to stop it; do not assume a close event alone distinguishes these
-cases.
+A request for a missing grid returns a handle without emitting `OpenWebview`.
+A plugin clear or focus notification has no effect on a window whose creation
+is still pending. Attachment cleanup cancels pending creation.
 
 `WebviewPosition` uses cells of its named grid, with a zero-based upper-left
 origin. Increasing `left` moves right; increasing `top` moves down. Convert its
@@ -651,6 +655,6 @@ The core's own tests validate engine behaviour, not your toolkit adapter.
 See [development and validation](development.md) for those checks and the
 requirements of the optional live integration suites.
 
-[spec]: https://github.com/nauvim/nauvim-spec/blob/main/specification.md
+[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.0.0/specification.md
 [ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.0/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/
