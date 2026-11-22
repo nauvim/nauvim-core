@@ -126,6 +126,7 @@ async fn ignores_invalid_client_ids_before_method_policy_and_argument_validation
             "nauvim-plugin/filesystem.clear",
             "nauvim-plugin/http.clear",
             "nauvim-plugin/http.focus_webview",
+            "nauvim-plugin/http.navigate_webview",
             "nauvim-plugin/unknown",
         ] {
             assert!(
@@ -822,16 +823,30 @@ async fn checks_webview_origins_and_focus_for_open_windows() {
     for input in [
         arguments((7, url, position(), 1, Nil)),
         arguments((7, url, position(), Nil, "true")),
-        arguments((7, url, position(), true, false, Nil)),
+        arguments((7, url, position(), true, false, 0)),
+        arguments((7, url, position(), true, false, Nil, Nil)),
     ] {
         assert!(dispatch.request(method, params(&input)).await.is_err());
     }
     assert!(events.try_recv().is_err());
 
     for (idx, (args, expected)) in [
-        (arguments((7, url, position(), Nil, Nil)), (true, true)),
-        (arguments((7, url, position(), false, Nil)), (false, true)),
-        (arguments((7, url, position(), true, false)), (true, false)),
+        (
+            arguments((7, url, position(), Nil, Nil, Nil)),
+            (true, true, false),
+        ),
+        (
+            arguments((7, url, position(), false, Nil, true)),
+            (false, true, true),
+        ),
+        (
+            arguments((7, url, position(), true, false)),
+            (true, false, false),
+        ),
+        (
+            arguments((7, url, position(), true, true, false)),
+            (true, true, false),
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -844,6 +859,7 @@ async fn checks_webview_origins_and_focus_for_open_windows() {
             url: opened_url,
             focus,
             focusable,
+            close_on_blur,
             window,
             ..
         } = events.try_recv().unwrap()
@@ -852,7 +868,7 @@ async fn checks_webview_origins_and_focus_for_open_windows() {
         };
         assert_eq!(handle.get(), id);
         assert_eq!(opened_url, url);
-        assert_eq!((focus, focusable), expected);
+        assert_eq!((focus, focusable, close_on_blur), expected);
 
         let args = arguments((7, id));
         dispatch
@@ -899,6 +915,137 @@ async fn checks_webview_origins_and_focus_for_open_windows() {
         .await
         .unwrap();
     assert!(events.try_recv().is_err(), "Unknown handles have no effect");
+    dispatch.resources.cleanup().await;
+}
+
+#[cfg(feature = "plugin-http")]
+#[tokio::test]
+async fn navigates_only_open_windows_using_their_original_policy() {
+    let (mut dispatch, mut events, dir) = dispatch(7);
+    let (errors, mut reports) = mpsc::unbounded_channel();
+    dispatch.resources = Arc::new(Resources::new(dir.path().to_owned(), errors));
+
+    let opening_policy = policies(
+        "return {plugin = {http = {open_webview = {origins = {'https://example.test'}}}}}",
+    );
+    let navigation = dispatch
+        .resources
+        .webview_navigation(opening_policy.webview);
+    let (handle, window) = dispatch
+        .resources
+        .reserve_webview(navigation, true)
+        .await
+        .unwrap();
+    dispatch.policies =
+        policies("return {plugin = {http = {open_webview = {origins = {'https://other.test'}}}}}");
+    let method = b"nauvim-plugin/http.navigate_webview";
+    let url = "https://example.test/page#section";
+    assert_eq!(
+        dispatch
+            .notification(method, params(&arguments((7, handle.get(), url))))
+            .await,
+        Err(format!("Webview {handle} is unavailable for navigation")),
+    );
+    assert!(events.try_recv().is_err());
+
+    assert!(window.opened());
+    let wrong_kind = dispatch.resources.reserve().await.unwrap();
+    for (args, error) in [
+        (
+            arguments((7, wrong_kind.get(), url)),
+            "unavailable for navigation",
+        ),
+        (arguments((7, 999, url)), "unavailable for navigation"),
+        (
+            arguments((7, handle.get(), "https://other.test")),
+            "Client policy denies",
+        ),
+        (
+            arguments((7, handle.get(), "ftp://example.test")),
+            "must use http or https",
+        ),
+        (arguments((7, handle.get(), "not a URL")), "relative URL"),
+        (
+            arguments((7, handle.get(), url, "true", Nil)),
+            "expected boolean",
+        ),
+        (
+            arguments((7, handle.get(), url, Nil, 1)),
+            "expected boolean",
+        ),
+    ] {
+        let actual = dispatch
+            .notification(method, params(&args))
+            .await
+            .unwrap_err();
+        assert!(
+            actual.contains(error),
+            "{actual:?} did not contain {error:?}"
+        );
+    }
+    assert!(events.try_recv().is_err());
+
+    for (args, expected) in [
+        (arguments((7, handle.get(), url, Nil, Nil)), (false, false)),
+        (arguments((7, handle.get(), url, true, true)), (true, true)),
+    ] {
+        dispatch.notification(method, params(&args)).await.unwrap();
+        let EngineEvent::NavigateWebview {
+            handle: selected,
+            url: target,
+            replace_history,
+            focus,
+            window: selected_window,
+        } = events.try_recv().unwrap()
+        else {
+            panic!("Expected a navigation event");
+        };
+        assert_eq!(selected, handle);
+        assert_eq!(target, url);
+        assert_eq!((replace_history, focus), expected);
+        assert!(selected_window.can_navigate());
+        assert!(selected_window.allows_navigation("https://example.test/redirect"));
+        assert!(!selected_window.allows_navigation("https://other.test/redirect"));
+        assert!(reports.try_recv().unwrap().contains("Client policy denies"));
+    }
+
+    let navigation = dispatch
+        .resources
+        .webview_navigation(dispatch.policies.webview.clone());
+    let (unfocusable, unfocusable_window) = dispatch
+        .resources
+        .reserve_webview(navigation, false)
+        .await
+        .unwrap();
+    assert!(unfocusable_window.opened());
+    dispatch
+        .notification(
+            method,
+            params(&arguments((
+                7,
+                unfocusable.get(),
+                "https://other.test",
+                true,
+                true,
+            ))),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        events.try_recv().unwrap(),
+        EngineEvent::NavigateWebview { handle, replace_history: true, focus: false, .. }
+            if handle == unfocusable
+    ));
+
+    assert!(dispatch.resources.clear_http(handle).await);
+    assert!(!window.can_navigate());
+    assert_eq!(
+        dispatch
+            .notification(method, params(&arguments((7, handle.get(), url))))
+            .await,
+        Err(format!("Webview {handle} is unavailable for navigation")),
+    );
+    assert!(events.try_recv().is_err());
     dispatch.resources.cleanup().await;
 }
 

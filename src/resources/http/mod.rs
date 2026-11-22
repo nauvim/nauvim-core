@@ -263,17 +263,23 @@ impl Resources {
         Ok((handle, window))
     }
 
-    pub(crate) async fn can_focus_webview(&self, handle: ResourceHandle) -> bool {
+    pub(crate) async fn webview_window(&self, handle: ResourceHandle) -> Option<WebviewWindow> {
         let state = self.registry.state.lock().await;
-        let Some(Resource {
+        let Resource {
             data: Data::Webview(window),
             ..
-        }) = state.entries.get(&handle)
+        } = state.entries.get(&handle)?
         else {
-            return false;
+            return None;
         };
 
-        window.upgrade().is_some_and(|window| window.can_focus())
+        window.upgrade().map(WebviewWindow)
+    }
+
+    pub(crate) async fn can_focus_webview(&self, handle: ResourceHandle) -> bool {
+        self.webview_window(handle)
+            .await
+            .is_some_and(|window| window.can_focus())
     }
 
     /// Cancels server startup, closes the HTTP listener or clears an open window.

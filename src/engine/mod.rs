@@ -53,6 +53,9 @@ pub enum EngineEvent {
         host: String,
     },
     Error(String),
+    /// Opens a plugin window using the frontend's presentation component.
+    ///
+    /// Enable available developer tools and keep them hidden when opening.
     OpenWebview {
         handle: ResourceHandle,
         url: String,
@@ -61,6 +64,8 @@ pub enum EngineEvent {
         focus: bool,
         /// Whether the window can receive focus.
         focusable: bool,
+        /// Whether to close the window immediately when it loses focus.
+        close_on_blur: bool,
         /// The frontend's navigation check and window lifecycle token.
         #[cfg(feature = "plugin-http")]
         window: WebviewWindow,
@@ -68,6 +73,18 @@ pub enum EngineEvent {
     /// Focuses an open and focusable plugin window through the frontend.
     FocusWebview {
         handle: ResourceHandle,
+    },
+    /// Navigates a plugin window through the frontend.
+    #[cfg(feature = "plugin-http")]
+    NavigateWebview {
+        handle: ResourceHandle,
+        url: String,
+        /// Whether to replace the current history entry.
+        replace_history: bool,
+        /// Whether to request focus when navigation is accepted.
+        focus: bool,
+        /// The window selected when core handled the notification.
+        window: WebviewWindow,
     },
     CloseWebview {
         handle: ResourceHandle,
@@ -571,6 +588,8 @@ impl Engine {
                 match event {
                     EngineEvent::Connect { host: destination } => host = Some(destination),
                     EngineEvent::OpenWebview { .. } | EngineEvent::FocusWebview { .. } => {}
+                    #[cfg(feature = "plugin-http")]
+                    EngineEvent::NavigateWebview { .. } => {}
                     event => self.queued.push_back(event),
                 }
             }

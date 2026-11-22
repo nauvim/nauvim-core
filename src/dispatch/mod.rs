@@ -35,6 +35,8 @@ use nvim_rpc_plugin::{Array, Bytes, Decode, Handler, Neovim};
 
 use tokio::io::AsyncWrite;
 use tokio::sync::mpsc;
+#[cfg(feature = "plugin-http")]
+use url::Url;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -171,16 +173,12 @@ impl Dispatch {
 
                 use nvim_rpc_plugin::Map;
 
-                use url::Url;
-
                 let url: String = next(&mut params)?;
-                let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
-                if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
-                    return Err("Webview URL must use http or https".into());
-                }
+                let parsed = webview_url(&url)?;
                 let mut map: Map = next(&mut params)?;
-                let focus = webview_flag(&mut params)?;
-                let focusable = webview_flag(&mut params)?;
+                let focus = webview_flag(&mut params, true)?;
+                let focusable = webview_flag(&mut params, true)?;
+                let close_on_blur = webview_flag(&mut params, false)?;
                 end(&params)?;
                 let mut grid = None;
                 let mut top = None;
@@ -268,6 +266,7 @@ impl Dispatch {
                         position,
                         focus,
                         focusable,
+                        close_on_blur,
                         window,
                     });
                 }
@@ -322,6 +321,30 @@ impl Dispatch {
                 if self.resources.can_focus_webview(handle).await {
                     let _ = self.events.send(EngineEvent::FocusWebview { handle });
                 }
+            }
+            #[cfg(feature = "plugin-http")]
+            b"nauvim-plugin/http.navigate_webview" => {
+                let handle = ResourceHandle::from(next::<i64>(&mut params)?);
+                let url: String = next(&mut params)?;
+                let parsed = webview_url(&url)?;
+                let replace_history = webview_flag(&mut params, false)?;
+                let focus = webview_flag(&mut params, false)?;
+                end(&params)?;
+
+                let window = self.resources.webview_window(handle).await;
+                let Some(window) = window.filter(|window| window.can_navigate()) else {
+                    return Err(format!("Webview {handle} is unavailable for navigation"));
+                };
+                allowed(window.allows_url(&parsed))?;
+
+                let focus = focus && window.can_focus();
+                let _ = self.events.send(EngineEvent::NavigateWebview {
+                    handle,
+                    url,
+                    replace_history,
+                    focus,
+                    window,
+                });
             }
             #[cfg(feature = "plugin-http")]
             b"nauvim-plugin/http.clear" => {
@@ -415,11 +438,20 @@ fn next<T: Decode<types::Object, Bytes>>(params: &mut Array) -> Result<T, String
 }
 
 #[cfg(feature = "plugin-http")]
-fn webview_flag(params: &mut Array) -> Result<bool, String> {
+fn webview_url(url: &str) -> Result<Url, String> {
+    let url = Url::parse(url).map_err(|e| e.to_string())?;
+    if !matches!(url.scheme(), "http" | "https") || url.host().is_none() {
+        return Err("Webview URL must use http or https".into());
+    }
+    Ok(url)
+}
+
+#[cfg(feature = "plugin-http")]
+fn webview_flag(params: &mut Array, default: bool) -> Result<bool, String> {
     use nvim_rpc_plugin::mp::decode::Object;
 
     match params.next() {
-        None | Some(Object::Nil) => Ok(true),
+        None | Some(Object::Nil) => Ok(default),
         Some(value) => {
             <bool as Decode<types::Object, Bytes>>::decode(value).map_err(|e| e.to_string())
         }

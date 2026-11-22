@@ -103,10 +103,13 @@ impl Window {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) != State::Closed
     }
 
-    pub(super) fn can_focus(&self) -> bool {
-        self.focusable
-            && *self.state.lock().unwrap_or_else(|e| e.into_inner()) == State::Open
+    fn is_open(&self) -> bool {
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) == State::Open
             && !self.stop.is_cancelled()
+    }
+
+    fn can_focus(&self) -> bool {
+        self.focusable && self.is_open()
     }
 
     pub(super) fn close_open(&self) -> bool {
@@ -149,7 +152,7 @@ impl WebviewWindow {
         if *state == State::Closed || self.0.stop.is_cancelled() {
             return false;
         }
-        if Url::parse(url).is_ok_and(|url| self.0.navigation.allows_url(&url)) {
+        if Url::parse(url).is_ok_and(|url| self.allows_url(&url)) {
             return true;
         }
 
@@ -159,7 +162,11 @@ impl WebviewWindow {
         false
     }
 
-    /// Marks a constructed window as open and eligible for focus notifications.
+    pub(crate) fn allows_url(&self, url: &Url) -> bool {
+        self.0.navigation.allows_url(url)
+    }
+
+    /// Marks a constructed window as open and eligible for focus and navigation.
     ///
     /// Retain a clone for as long as the window is open. If this returns `false`,
     /// discard the window because its attachment or operation has closed.
@@ -183,7 +190,15 @@ impl WebviewWindow {
         self.0.can_focus()
     }
 
-    /// Reports a frontend creation, loading or focus error as an engine event.
+    /// Checks whether the window is still open on a live attachment.
+    ///
+    /// Use this before handling a navigation event if the window can have
+    /// closed since the event was queued.
+    pub fn can_navigate(&self) -> bool {
+        self.0.is_open()
+    }
+
+    /// Reports a frontend creation, navigation, history or focus error as an engine event.
     pub fn report_error(&self, error: impl Into<String>) {
         let _ = self.0.errors.send(error.into());
     }
