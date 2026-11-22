@@ -6,7 +6,7 @@ use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
 use crate::resources::clipboard::Clipboard;
 use crate::resources::{Registry, Resources};
-use crate::{ClientId, Config, Error, Frame, GridId, ResourceHandle, Transport};
+use crate::{Checkpoint, ClientId, Config, Error, Frame, GridId, ResourceHandle, Transport};
 
 mod attempt;
 use attempt::Attempt;
@@ -242,6 +242,15 @@ impl Engine {
         self.active.as_ref().map(|a| a.rpc.client.clone())
     }
 
+    /// Returns the active attachment's latest committed display checkpoint.
+    ///
+    /// The receiver updates the checkpoint at redraw flushes, independently of
+    /// [`Self::next_event()`]. Returns `None` when there is no active attachment
+    /// or a fresh attachment has not received its first flush.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.active.as_ref()?.rpc.frames.checkpoint()
+    }
+
     /// Pastes the client system clipboard into the currently attached Neovim.
     ///
     /// Reads the `+` selection and delegates literal text to [`Client::paste()`],
@@ -297,6 +306,31 @@ impl Engine {
     /// Later calls have no effect. Detachment and recovery never repeat the
     /// automatic startup connection.
     pub async fn start(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        self.start_selection(width, height, None).await
+    }
+
+    /// Applies startup host selection with a caller-supplied checkpoint.
+    ///
+    /// Uses the selection rules of [`Self::start()`]. Supply a checkpoint for
+    /// the same running Neovim process that the configuration selects. A
+    /// selected host follows the reattachment rules of
+    /// [`Self::connect_with_checkpoint()`]. If there is no startup selection,
+    /// opens the welcome page.
+    pub async fn start_with_checkpoint(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.start_selection(width, height, Some(checkpoint)).await
+    }
+
+    async fn start_selection(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Option<Checkpoint>,
+    ) -> Result<(), Error> {
         use crate::HostSelection;
 
         if self.closed {
@@ -308,10 +342,14 @@ impl Engine {
         self.install_signal()?;
         self.started = true;
         match self.config.startup_host() {
-            Some(HostSelection::Default) => self.connect_default(width, height).await,
+            Some(HostSelection::Default) => {
+                self.connect_selection(None, width, height, checkpoint)
+                    .await
+            }
             Some(HostSelection::Alias(alias)) => {
                 let alias = alias.to_owned();
-                self.connect(&alias, width, height).await
+                self.connect_selection(Some(&alias), width, height, checkpoint)
+                    .await
             }
             None => {
                 self.install_signal()?;
@@ -326,12 +364,44 @@ impl Engine {
     /// On failure there is no active attachment and a welcome event carries the
     /// error. Function-valued paths receive host-role information.
     pub async fn connect(&mut self, alias: &str, width: u32, height: u32) -> Result<(), Error> {
-        self.connect_selection(Some(alias), width, height).await
+        self.connect_selection(Some(alias), width, height, None)
+            .await
+    }
+
+    /// Reattaches to a host alias with a caller-supplied display checkpoint.
+    ///
+    /// Supply a checkpoint for the same running Neovim process. The receiving
+    /// UI model applies it before attachment and the first frame requests a
+    /// full repaint. If the selected socket has no running session, returns a
+    /// connection error. Attachment failures follow [`Self::connect()`].
+    pub async fn connect_with_checkpoint(
+        &mut self,
+        alias: &str,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.connect_selection(Some(alias), width, height, Some(checkpoint))
+            .await
     }
 
     /// Starts or reuses the independent default local host.
     pub async fn connect_default(&mut self, width: u32, height: u32) -> Result<(), Error> {
-        self.connect_selection(None, width, height).await
+        self.connect_selection(None, width, height, None).await
+    }
+
+    /// Reattaches to the default local host with a caller-supplied checkpoint.
+    ///
+    /// Uses the same checkpoint and frame contract as
+    /// [`Self::connect_with_checkpoint()`].
+    pub async fn connect_default_with_checkpoint(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.connect_selection(None, width, height, Some(checkpoint))
+            .await
     }
 
     async fn connect_selection(
@@ -339,8 +409,9 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
-        self.begin_connection(alias, width, height)?;
+        self.begin_connection(alias, width, height, checkpoint)?;
         self.wait_connection().await
     }
 
@@ -364,6 +435,7 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Message("Engine has shut down".into()));
@@ -396,7 +468,7 @@ impl Engine {
             .runtime
             .as_ref()
             .ok_or_else(|| Error::Message("Connection runtime is unavailable".into()))?;
-        let task = runtime.spawn(attempt.run(alias, width, height, task_stop));
+        let task = runtime.spawn(attempt.run(alias, width, height, checkpoint, task_stop));
         self.connecting = Some(Connecting { stop, task });
         Ok(())
     }
@@ -504,7 +576,7 @@ impl Engine {
         }
         if let Some(host) = self.pending_host.take() {
             let (width, height) = self.dimensions;
-            let _ = self.begin_connection(Some(&host), width, height);
+            let _ = self.begin_connection(Some(&host), width, height, None);
             if let Some(event) = self.queued.pop_front() {
                 return event;
             }
@@ -839,6 +911,7 @@ mod tests {
             wtr,
             NoHandler,
             ConnectionOptions::default(),
+            None,
             #[cfg(feature = "plugin-http")]
             Grids::default(),
         )
@@ -970,6 +1043,7 @@ mod tests {
                 wtr,
                 NoHandler,
                 ConnectionOptions::default(),
+                None,
                 #[cfg(feature = "plugin-http")]
                 Grids::default(),
             )

@@ -101,9 +101,9 @@ policies = {
   Either setting can use `"all"` to allow all valid requests of its type.
 - `clipboard.copy` permits host-initiated writes to the client clipboard.
 
-Denied requests return an error to the plugin. Denied notifications report an
-error in Nauvim. Handle queries, cleanup, Webview focus, and GUI paste follow
-their ordinary rules.
+Denied requests return an error to the plugin. For denied notifications, the
+engine emits `EngineEvent::Error`. Handle queries, cleanup, Webview focus, and
+GUI paste follow their ordinary rules.
 
 ## Selecting a startup host
 
@@ -140,14 +140,14 @@ empty environment mapping.
 ```lua
 nvim = {
     args = { "-O3", "-u", "/host/path/to/init.lua" },
-    env = { NVIM_APPNAME = "nauvim" },
+    env = { NVIM_APPNAME = "work-nvim" },
 }
 ```
 
 Arguments and environment values are strings. The implementation passes them
 literally, with environment entries overriding inherited values. It does not
 split an executable string or expand shell expressions within configured values.
-Nauvim appends `"--headless", "--listen", socket` immediately after `args`.
+The engine appends `"--headless", "--listen", socket` immediately after `args`.
 A string-valued `nvim` has no configured arguments. Program executability is
 checked by launching it, rather than by a separate validation step.
 
@@ -159,7 +159,7 @@ the appended arguments through to Neovim.
 ```lua
 nvim = {
     prog = "sh",
-    args = { "-c", [[exec "$@"]], "nauvim", "nvim", "-O3" },
+    args = { "-c", [[exec "$@"]], "nvim-wrapper", "nvim", "-O3" },
 }
 ```
 
@@ -179,12 +179,12 @@ nvim = function(host)
 end
 ```
 
-When `socket` is omitted, Nauvim uses a short hashed filename in a private
+When `socket` is omitted, the engine uses a short hashed filename in a private
 `/tmp/nauvim-sockets-<uid>` directory on the machine running Neovim. The
 directory uses the host account's effective user ID. The filename depends on
-the client hostname, client effective username, and host selection, so
-reopening Nauvim finds the same session. To reconnect to a session started with
-an older default, set `socket` to that session's path.
+the client hostname, client effective username, and host selection. A later
+engine instance uses the same path to find the session. To reconnect to a
+session started with an older default, set `socket` to that session's path.
 
 An explicit `socket` setting selects the endpoint for discovery. Choose a path
 reserved for this client environment. If a local socket path exceeds the

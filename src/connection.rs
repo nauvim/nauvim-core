@@ -7,7 +7,7 @@ use nvim_rpc_plugin::{Array, Neovim};
 use nvim_rpc_plugin::{Connection as RpcConnection, ConnectionError, Handler};
 #[cfg(feature = "plugin-http")]
 use nvim_rpc_ui::GridId;
-use nvim_rpc_ui::{Client, ClientError, ConnectionOptions, Frames, UiHandler};
+use nvim_rpc_ui::{Checkpoint, Client, ClientError, ConnectionOptions, Frames, UiHandler};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -46,6 +46,7 @@ pub(crate) fn connect<R, W, H>(
     wtr: W,
     handler: H,
     options: ConnectionOptions,
+    checkpoint: Option<Checkpoint>,
     #[cfg(feature = "plugin-http")] grids: Grids,
 ) -> Result<Connection<W>, Error>
 where
@@ -56,7 +57,16 @@ where
     use nvim_rpc_plugin::connect as connect_rpc;
     use nvim_rpc_ui::Error as UiError;
 
-    let (handler, frames) = UiHandler::new(handler, options.limits);
+    let (handler, frames) = match checkpoint {
+        Some(checkpoint) => UiHandler::from_checkpoint(handler, checkpoint, options.limits)
+            .map_err(|e| Error::Message(format!("Restore UI checkpoint: {e}")))?,
+        None => UiHandler::new(handler, options.limits),
+    };
+    #[cfg(feature = "plugin-http")]
+    if let Some(checkpoint) = frames.checkpoint() {
+        let mut grids = grids.write().unwrap_or_else(|e| e.into_inner());
+        grids.extend(checkpoint.state().grids.keys().copied());
+    }
     #[cfg(feature = "plugin-http")]
     let handler = Tracked {
         inner: handler,
@@ -208,6 +218,79 @@ mod tests {
             [GridId(1)]
         );
         rpc.close_and_wait().await.unwrap();
+    }
+
+    fn checkpoint_with_hidden_grid() -> Checkpoint {
+        use nvim_rpc_ui::Model;
+
+        let mut bytes = Vec::new();
+        bytes
+            .write_primitive((
+                ("grid_resize", (1, 3, 2), (2, 2, 2)),
+                ("win_hide", (2,)),
+                ("flush", ()),
+            ))
+            .consume();
+        let redraw = params(&bytes);
+        let mut model = Model::default();
+        model
+            .apply_notification(b"redraw", redraw.with_borrowed_buffer(), |_| {})
+            .unwrap();
+        model.checkpoint().unwrap()
+    }
+
+    #[tokio::test]
+    async fn restores_plugin_grid_ids_before_the_first_redraw() {
+        use nvim_rpc_ui::NoHandler;
+
+        use tokio::io::{duplex, split};
+
+        let grids = Grids::default();
+        let (stream, _peer) = duplex(4096);
+        let (rdr, wtr) = split(stream);
+        let mut connection = connect(
+            rdr,
+            wtr,
+            NoHandler,
+            ConnectionOptions::default(),
+            Some(checkpoint_with_hidden_grid()),
+            Arc::clone(&grids),
+        )
+        .unwrap();
+
+        assert_eq!(
+            grids.read().unwrap().iter().copied().collect::<Vec<_>>(),
+            [GridId(1), GridId(2)]
+        );
+        connection.stop();
+        connection.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_checkpoints_outside_the_connection_limits() {
+        use nvim_rpc_ui::NoHandler;
+
+        use tokio::io::{duplex, split};
+
+        let mut options = ConnectionOptions::default();
+        options.limits.max_grids = 1;
+        let grids = Grids::default();
+        let (stream, _peer) = duplex(4096);
+        let (rdr, wtr) = split(stream);
+        let result = connect(
+            rdr,
+            wtr,
+            NoHandler,
+            options,
+            Some(checkpoint_with_hidden_grid()),
+            Arc::clone(&grids),
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Message(message)) if message.starts_with("Restore UI checkpoint: ")
+        ));
+        assert!(grids.read().unwrap().is_empty());
     }
 
     #[test]

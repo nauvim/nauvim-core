@@ -3,7 +3,7 @@ use crate::resources::Registry;
 use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
 use crate::resources::clipboard::Clipboard;
-use crate::{ClientId, Config, Error, Policies, Transport};
+use crate::{Checkpoint, ClientId, Config, Error, Policies, Transport};
 
 use super::{ATTACH_TIMEOUT, Attachment, CHECK_TIMEOUT, EngineEvent};
 
@@ -37,11 +37,12 @@ impl Attempt {
         alias: Option<String>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
         stop: CancellationToken,
     ) -> Result<Attachment, Error> {
         let result = tokio::select! {
             () = stop.cancelled() => Err(Error::Message("Session attachment cancelled".into())),
-            result = timeout(ATTACH_TIMEOUT, self.connect_inner(alias.as_deref(), width, height)) =>
+            result = timeout(ATTACH_TIMEOUT, self.connect_inner(alias.as_deref(), width, height, checkpoint)) =>
                 result.unwrap_or_else(|_| Err(Error::Timeout("Session attachment"))),
         };
         match result {
@@ -63,6 +64,7 @@ impl Attempt {
         alias: Option<&str>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
         use crate::connection;
         #[cfg(feature = "plugin-http")]
@@ -82,6 +84,7 @@ impl Attempt {
         #[cfg(not(feature = "ssh"))]
         let is_remote =
             alias.is_some_and(|alias| self.config.hosts.get(alias).is_none_or(|h| h.remote));
+        let reuse_only = checkpoint.is_some();
         let (transport, _policies, _remote) = if is_remote {
             #[cfg(feature = "ssh")]
             {
@@ -89,7 +92,7 @@ impl Attempt {
 
                 let alias =
                     alias.ok_or_else(|| Error::Message("Missing remote host alias".into()))?;
-                let (transport, remote) = ssh::open(&self.config, alias).await?;
+                let (transport, remote) = ssh::open(&self.config, alias, reuse_only).await?;
                 let policies = self
                     .config
                     .hosts
@@ -105,7 +108,7 @@ impl Attempt {
                 ));
             }
         } else {
-            let (transport, policies) = self.open_local(alias).await?;
+            let (transport, policies) = self.open_local(alias, reuse_only).await?;
             (transport, policies, None::<RemoteMarker>)
         };
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -159,9 +162,21 @@ impl Attempt {
             writer,
             handler,
             ConnectionOptions::default(),
+            checkpoint,
             #[cfg(feature = "plugin-http")]
             grids,
-        )?;
+        );
+        #[cfg(feature = "ssh")]
+        if rpc.is_err()
+            && let Some(remote) = &_remote
+        {
+            use openrussh_client::connect::Disconnect;
+
+            let _ = remote
+                .disconnect(Disconnect::ByApplication, "Attachment failed", "en")
+                .await;
+        }
+        let rpc = rpc?;
         // Store before any awaited registration so timeout/cancellation can close it.
         self.active = Some(Attachment {
             rpc,
@@ -291,7 +306,11 @@ impl Attempt {
         Ok(())
     }
 
-    async fn open_local(&mut self, alias: Option<&str>) -> Result<(Transport, Policies), Error> {
+    async fn open_local(
+        &self,
+        alias: Option<&str>,
+        reuse_only: bool,
+    ) -> Result<(Transport, Policies), Error> {
         use crate::HostInfo;
         use crate::socket;
 
@@ -329,6 +348,12 @@ impl Attempt {
             .map_err(|_| Error::Timeout("Socket staleness check"))??
         {
             return Ok((Transport::local(stream), policies));
+        }
+        if reuse_only {
+            return Err(Error::Message(format!(
+                "Reattach to Neovim at {}: no running session",
+                path.display()
+            )));
         }
         if host.socket.is_some()
             && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())

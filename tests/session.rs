@@ -1,4 +1,11 @@
-use nauvim_core::{Client, Config, Engine, EngineEvent, Frame};
+use nauvim_core::{Client, Config, Engine, EngineEvent};
+
+mod support;
+use support::checkpoint::{
+    assert_no_markers, hidden_grids, leave_inactive_tab, next_frame, restored_grids,
+    revisit_inactive_tab,
+};
+use support::is_clipboard_detection_error;
 
 use nvim_rpc_plugin::{Object, api};
 
@@ -21,13 +28,20 @@ fn lua_string(s: &str) -> String {
 }
 
 fn config(root: &Path, socket: &Path) -> Config {
-    let bin = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
     // Exercise core registration without requiring the separate Lua component.
     let startup = r#"lua package.preload['nauvim-plugin.client']=function() return {
         setup=function(opts) _G.nauvim_test_setup_id=opts.client_id end
     } end"#;
+    session_config(root, socket, Some(startup))
+}
+
+fn session_config(root: &Path, socket: &Path, startup: Option<&str>) -> Config {
+    let bin = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
+    let extra_args = startup
+        .map(|script| format!(", \"--cmd\", {}", lua_string(script)))
+        .unwrap_or_default();
     let src = format!(
-        r#"local program = {{prog = {}, args = {{"-u", "NONE", "-i", "NONE", "-n", "--cmd", {}}}, env = {{}}}}
+        r#"local program = {{prog = {}, args = {{"-u", "NONE", "-i", "NONE", "-n"{extra_args}}}}}
         return {{hosts = {{
             local_host = {{
                 nvim = program,
@@ -36,7 +50,6 @@ fn config(root: &Path, socket: &Path) -> Config {
             next_host = {{nvim = program, socket = {}}},
         }}}}"#,
         lua_string(&bin),
-        lua_string(startup),
         lua_string(socket.to_str().unwrap()),
         lua_string(socket.with_extension("next.sock").to_str().unwrap())
     );
@@ -76,28 +89,13 @@ async fn wait_setup(engine: &Engine, client: &Client) {
     .expect("host-side asynchronous setup did not run");
 }
 
-async fn next_frame(engine: &mut Engine) -> Frame {
-    timeout(Duration::from_secs(5), async {
-        loop {
-            match engine.next_event().await {
-                EngineEvent::Frame(frame) => return frame,
-                EngineEvent::Error(e) | EngineEvent::Welcome { error: Some(e) } => {
-                    panic!("unexpected engine error: {e}")
-                }
-                _ => {}
-            }
-        }
-    })
-    .await
-    .expect("Neovim did not publish a frame")
-}
-
 async fn next_welcome(engine: &mut Engine) -> Option<String> {
     timeout(Duration::from_secs(5), async {
         loop {
             match engine.next_event().await {
                 EngineEvent::Welcome { error } => return error,
                 EngineEvent::Frame(_) => {}
+                EngineEvent::Error(e) if is_clipboard_detection_error(&e) => {}
                 EngineEvent::Error(e) => panic!("unexpected error event: {e}"),
                 _ => panic!("unexpected plugin event while awaiting welcome page"),
             }
@@ -172,20 +170,18 @@ async fn reports_overlong_local_socket_paths_on_the_welcome_page() {
 
 #[tokio::test]
 #[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
-async fn live_reopens_a_short_default_local_socket() {
+async fn live_restores_a_checkpoint_at_startup_on_a_default_local_socket() {
     let nvim = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
     let root = tempdir().unwrap();
     let alias = root.path().file_name().unwrap().to_str().unwrap();
+    let src = format!(
+        r#"local alias = {}
+        return {{default_host = alias, hosts = {{[alias] = {{nvim = {{prog = {}, args = {{'-u', 'NONE', '-i', 'NONE', '-n'}}}}}}}}}}"#,
+        lua_string(alias),
+        lua_string(&nvim),
+    );
     let file = root.path().join("config.lua");
-    fs::write(
-        &file,
-        format!(
-            r#"return {{hosts = {{[{}] = {{nvim = {{prog = {}, args = {{'-u', 'NONE', '-i', 'NONE', '-n'}}}}}}}}}}"#,
-            lua_string(alias),
-            lua_string(&nvim),
-        ),
-    )
-    .unwrap();
+    fs::write(&file, src).unwrap();
     let config = || {
         Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(()))
             .unwrap()
@@ -200,11 +196,17 @@ async fn live_reopens_a_short_default_local_socket() {
         .request::<api::NvimEval, String>(("v:servername",))
         .await
         .unwrap();
+    leave_inactive_tab(&client).await;
+    let checkpoint = first.checkpoint().unwrap();
     first.shutdown().await.unwrap();
 
     let mut second = Engine::new(config()).unwrap();
-    second.connect(alias, 60, 16).await.unwrap();
+    second
+        .start_with_checkpoint(60, 16, checkpoint)
+        .await
+        .unwrap();
     let reattached_pid = pid(&second.client().unwrap()).await;
+    restored_grids(&mut second).await;
     quit(&mut second).await;
 
     assert_eq!(reattached_pid, process_id);
@@ -395,6 +397,172 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
 
 #[tokio::test]
 #[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_restores_checkpoints_when_reattaching_and_switching_owned_hosts() {
+    let root = tempdir().unwrap();
+    let socket = root.path().join("checkpoint.sock");
+    let startup =
+        "lua assert(vim.env.NAUVIM_CONNECTION == 'local'); vim.env.NAUVIM_CONNECTION = nil";
+    let mut engine = Engine::new(session_config(root.path(), &socket, Some(startup))).unwrap();
+    engine.connect("local_host", 80, 24).await.unwrap();
+    let client = engine.client().unwrap();
+    assert!(lua_bool(&client, "return vim.env.NAUVIM_CONNECTION == nil").await);
+    let host_pid = pid(&client).await;
+    leave_inactive_tab(&client).await;
+    let checkpoint = engine.checkpoint().unwrap();
+    assert!(hidden_grids(checkpoint.state()).is_some());
+
+    engine.detach().await.unwrap();
+    assert!(engine.checkpoint().is_none());
+    engine
+        .connect_with_checkpoint("local_host", 80, 24, checkpoint.clone())
+        .await
+        .unwrap();
+    assert_eq!(pid(&engine.client().unwrap()).await, host_pid);
+    timeout(Duration::from_secs(5), async {
+        while client
+            .nvim()
+            .request::<api::NvimEval, i64>(("getpid()",))
+            .await
+            .is_ok()
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the previous attachment did not close");
+    let grids = restored_grids(&mut engine).await;
+
+    engine.connect("next_host", 80, 24).await.unwrap();
+    let other = engine.client().unwrap();
+    assert_ne!(pid(&other).await, host_pid);
+    assert_no_markers(&next_frame(&mut engine).await);
+    let _ = timeout(Duration::from_secs(5), other.command("qa!"))
+        .await
+        .unwrap();
+    assert_eq!(next_welcome(&mut engine).await, None);
+
+    engine
+        .connect_with_checkpoint("local_host", 80, 24, checkpoint.clone())
+        .await
+        .unwrap();
+    let client = engine.client().unwrap();
+    assert_eq!(pid(&client).await, host_pid);
+    assert_eq!(restored_grids(&mut engine).await, grids);
+    revisit_inactive_tab(&mut engine, &client, &grids).await;
+
+    let _ = timeout(Duration::from_secs(5), client.command("qa!"))
+        .await
+        .unwrap();
+    assert_eq!(next_welcome(&mut engine).await, None);
+    let error = engine
+        .connect_with_checkpoint("local_host", 80, 24, checkpoint)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.ends_with("no running session"), "{error}");
+    assert_eq!(next_welcome(&mut engine).await, Some(error));
+    assert!(engine.client().is_none());
+    assert!(!socket.exists());
+
+    engine.connect("local_host", 80, 24).await.unwrap();
+    assert_ne!(pid(&engine.client().unwrap()).await, host_pid);
+    assert_no_markers(&next_frame(&mut engine).await);
+    quit(&mut engine).await;
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_restores_an_inactive_tab_in_a_new_client_process() {
+    use nauvim_core::Checkpoint;
+
+    use nvim_rpc_ui::Limits;
+
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+    use std::process;
+
+    const TEST: &str = "live_restores_an_inactive_tab_in_a_new_client_process";
+    const ROOT: &str = "NAUVIM_CHECKPOINT_TEST_ROOT";
+    const STAGE: &str = "NAUVIM_CHECKPOINT_TEST_STAGE";
+    const PID_FILE: &str = "host-pid";
+    const CHECKPOINT_FILE: &str = "checkpoint";
+    const TEMP_DIR_FILE: &str = "client-temp-dir";
+
+    if let Some(root) = env::var_os(ROOT) {
+        let root = Path::new(&root);
+        let socket = root.join("checkpoint.sock");
+        let mut engine = Engine::new(session_config(root, &socket, None)).unwrap();
+
+        match env::var(STAGE).as_deref() {
+            Ok("prepare") => {
+                engine.connect("local_host", 80, 24).await.unwrap();
+                let client = engine.client().unwrap();
+                let host_pid = pid(&client).await;
+                fs::write(root.join(PID_FILE), host_pid.to_string()).unwrap();
+                fs::write(
+                    root.join(TEMP_DIR_FILE),
+                    engine.temp_dir().as_os_str().as_encoded_bytes(),
+                )
+                .unwrap();
+                leave_inactive_tab(&client).await;
+
+                let checkpoint = engine.checkpoint().unwrap();
+                assert!(hidden_grids(checkpoint.state()).is_some());
+                fs::write(root.join(CHECKPOINT_FILE), checkpoint.encode().unwrap()).unwrap();
+                process::exit(0);
+            }
+            Ok("restore") => {
+                let bytes = fs::read(root.join(CHECKPOINT_FILE)).unwrap();
+                let checkpoint =
+                    Checkpoint::decode(&bytes, Limits::default(), bytes.len()).unwrap();
+                engine
+                    .connect_with_checkpoint("local_host", 80, 24, checkpoint)
+                    .await
+                    .unwrap();
+                let client = engine.client().unwrap();
+                let original = fs::read_to_string(root.join(PID_FILE)).unwrap();
+                assert_eq!(pid(&client).await, original.parse::<i64>().unwrap());
+                let grids = restored_grids(&mut engine).await;
+                revisit_inactive_tab(&mut engine, &client, &grids).await;
+                quit(&mut engine).await;
+            }
+            stage => panic!("unexpected checkpoint fixture stage {stage:?}"),
+        }
+        return;
+    }
+
+    let root = tempdir().unwrap();
+    for stage in ["prepare", "restore"] {
+        let mut child = Command::new(env::current_exe().unwrap())
+            .args(["--ignored", "--exact", TEST, "--nocapture"])
+            .env(ROOT, root.path())
+            .env(STAGE, stage)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = timeout(Duration::from_secs(30), child.wait()).await;
+        if !matches!(&result, Ok(Ok(_))) {
+            let _ = child.kill().await;
+        }
+        if stage == "prepare"
+            && let Ok(dir) = fs::read(root.path().join(TEMP_DIR_FILE))
+        {
+            let _ = fs::remove_dir(OsString::from_vec(dir));
+        }
+        if !matches!(&result, Ok(Ok(status)) if status.success()) {
+            if let Ok(host_pid) = fs::read_to_string(root.path().join(PID_FILE)) {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &host_pid])
+                    .status()
+                    .await;
+            }
+            panic!("checkpoint fixture for {stage:?} failed: {result:?}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
 async fn live_discards_invalid_client_ids_before_validating_plugin_arguments() {
     let root = tempdir().unwrap();
     let mut engine = Engine::new(config(root.path(), &root.path().join("ids.sock"))).unwrap();
@@ -518,6 +686,8 @@ async fn live_plugin_connect_emits_welcome_then_destination_and_keeps_host_alive
     let host_pid = pid(&client).await;
     let client_id = engine.client_id();
     wait_setup(&engine, &client).await;
+    leave_inactive_tab(&client).await;
+    let checkpoint = engine.checkpoint().unwrap();
     let _ = timeout(
         Duration::from_secs(5),
         client
@@ -534,6 +704,7 @@ async fn live_plugin_connect_emits_welcome_then_destination_and_keeps_host_alive
             match engine.next_event().await {
                 EngineEvent::Welcome { error: None } => break,
                 EngineEvent::Frame(_) => {}
+                EngineEvent::Error(e) if is_clipboard_detection_error(&e) => {}
                 EngineEvent::Welcome { error: Some(e) } | EngineEvent::Error(e) => {
                     panic!("switch failed: {e}")
                 }
@@ -549,10 +720,14 @@ async fn live_plugin_connect_emits_welcome_then_destination_and_keeps_host_alive
     ));
     assert!(engine.client().is_none());
     assert!(engine.temp_dir().is_dir());
-    engine.connect("local_host", 50, 12).await.unwrap();
+    engine
+        .connect_with_checkpoint("local_host", 50, 12, checkpoint)
+        .await
+        .unwrap();
     assert_eq!(engine.client_id(), client_id);
     let client = engine.client().unwrap();
     assert_eq!(pid(&client).await, host_pid);
+    restored_grids(&mut engine).await;
     quit(&mut engine).await;
 }
 
@@ -678,7 +853,6 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
     use std::str;
 
     let root = tempdir().unwrap();
-    let file = root.path().join("config.lua");
     let init = root.path().join("init.lua");
     let socket = root.path().join("literal ' socket.sock");
     let record = root.path().join("argv record");
@@ -703,6 +877,7 @@ async fn live_structured_shell_program_preserves_environment_and_argument_suffix
         lua_string(literal),
         lua_string(socket.to_str().unwrap())
     );
+    let file = root.path().join("config.lua");
     fs::write(&file, src).unwrap();
     let (config, ()) =
         Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(())).unwrap();

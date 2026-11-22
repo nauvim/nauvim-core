@@ -51,7 +51,11 @@ impl MakeHandler for Handlers<'_> {
     }
 }
 
-pub(crate) async fn open(config: &Config, alias: &str) -> Result<(Transport, Remote), Error> {
+pub(crate) async fn open(
+    config: &Config,
+    alias: &str,
+    reuse_only: bool,
+) -> Result<(Transport, Remote), Error> {
     let Resolved { chain, preferences } = resolve_host(config, alias)?;
     let known = KnownHosts::parse_path(&config.known_hosts)?;
     let conn = Arc::new(
@@ -66,7 +70,7 @@ pub(crate) async fn open(config: &Config, alias: &str) -> Result<(Transport, Rem
         .await
         .map_err(Error::from)?,
     );
-    let result = open_on(config, alias, &conn).await;
+    let result = open_on(config, alias, &conn, reuse_only).await;
     match result {
         Ok(transport) => Ok((transport, conn)),
         Err(e) => {
@@ -78,7 +82,12 @@ pub(crate) async fn open(config: &Config, alias: &str) -> Result<(Transport, Rem
     }
 }
 
-async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transport, Error> {
+async fn open_on(
+    config: &Config,
+    alias: &str,
+    conn: &Remote,
+    reuse_only: bool,
+) -> Result<Transport, Error> {
     use crate::socket::{self, DIR_PREFIX, Destination};
 
     let host = config.hosts.get(alias);
@@ -106,6 +115,11 @@ async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transpor
         .map_err(|_| Error::Timeout("Remote socket staleness check"))??;
     if let Some(stream) = stream {
         return Ok(Transport::remote(stream));
+    }
+    if reuse_only {
+        return Err(Error::Message(format!(
+            "Reattach to Neovim on {alias:?} at {socket}: no running session"
+        )));
     }
     // A detached shell job has no inherited channel I/O and survives SSH closure.
     // Values are positional shell arguments, never interpolated into the script.

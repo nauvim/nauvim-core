@@ -1,14 +1,13 @@
 # Frontend implementor guide
 
-This guide is for anyone building a Nauvim UI with `nauvim-core`. A frontend can
-use any toolkit, renderer, language bridge, or repository layout.
+This guide is for frontend developers using `nauvim-core`. You choose the
+toolkit and renderer.
 
 The [Nauvim specification][spec] defines the required behaviour. This guide
 explains how to provide that behaviour through this crate's public API.
 The supported host Neovim version is v0.12.6. The specified client and host
 targets are Linux x86-64 and aarch64 and macOS Apple Silicon. The specification
-defines at most one running Nauvim application in a client environment;
-concurrent application instances are outside that defined configuration.
+covers one application process per client environment.
 
 Use the [configuration reference](usage.md) for Lua settings and the crate's
 rustdoc for individual methods. The [nvim-rpc-ui reference][ui-crate] describes
@@ -230,7 +229,7 @@ actions.
 | --- | --- |
 | `Frame(frame)` | Pass the frame to your rendering adapter. Preserve its ordered application events. |
 | `Welcome { error }` | Show destination selection, reset attachment-specific rendering and input state, and display the optional error. Keep receiving events. |
-| `Connect { host }` | Show the destination or connection progress. Continue receiving events; the engine performs this switch. |
+| `Connect { host }` | Show the destination or connection progress. Continue receiving events to start the connection. |
 | `Error(message)` | Display a client error. This event alone does not end an attachment. |
 | `OpenWebview` | Begin creating the requested GUI window and retain its `WebviewWindow` by resource handle. |
 | `FocusWebview { handle }` | Focus the window if it is still open and focusable. |
@@ -268,16 +267,17 @@ loop {
 }
 ```
 
-A plugin host switch produces `Welcome`, then `Connect { host }`. A later
-`next_event()` starts the destination connection. Treat `Connect` as status;
-calling `connect()` in response starts a second selection and supersedes the
-engine's pending switch. Cleanup events for the previous attachment can arrive
-while the destination is connecting or already active. Continue applying those
-events to the windows identified by their handles.
+A plugin host switch produces `Welcome`, then `Connect { host }`. The next call
+to `Engine::next_event()` starts the destination connection. To supply a checkpoint
+for that destination, call `Engine::connect_with_checkpoint()` before receiving
+another event. The explicit connection supersedes the pending automatic
+connection. Cleanup events for the previous attachment can arrive while the
+destination is connecting or already active. Continue applying those events
+to the windows identified by their handles.
 
 This engine event differs from `nvim_rpc_ui::Event::Connect` and `Restart` in
 `Frame::events`. Those carry Neovim server addresses; core surfaces them without
-automatically switching sessions. `Engine::connect()` takes a Nauvim host alias,
+automatically switching sessions. `Engine::connect()` takes a host alias,
 so keep the address-carrying frame events distinct from alias selection.
 
 For a host selection initiated by your own UI, reset the renderer's old-session
@@ -297,6 +297,33 @@ fn present(&mut self, frame: Frame) -> Result<(), Self::Error>;
 
 The frontend owns presentation failures and displays them in the client UI.
 The engine does not call the backend or automatically receive its error value.
+
+### Restoring UI checkpoints
+
+Call `Engine::checkpoint()` while the attachment is active to capture its
+latest committed UI state, including hidden grids. The checkpoint can include
+redraws whose frames the frontend has yet to receive. A fresh attachment's
+first redraw flush makes its initial checkpoint available. Capture a checkpoint
+before ending the attachment.
+
+The caller owns checkpoint storage and must match a checkpoint to the same
+running Neovim process that produced it. A host alias identifies a connection
+destination and can point to a replacement process. Use `Checkpoint::encode()`
+and `Checkpoint::decode()` to convert between checkpoints and bytes. See the
+[nvim-rpc-ui reference][ui-crate].
+
+Supply the checkpoint to `Engine::connect_with_checkpoint()` for a host alias,
+`Engine::connect_default_with_checkpoint()` for the default local host, or
+`Engine::start_with_checkpoint()` for automatic startup selection. These
+methods reattach to a running Neovim. A missing session or an invalid
+checkpoint follows the regular connection failure path. Use the ordinary
+connection methods to start a fresh session. The engine passes an accepted
+checkpoint to `nvim-rpc-ui` before attaching the UI.
+
+The first frame of a restored attachment requests a full repaint. Present it
+through the ordinary frame path. Its events come from the new attachment.
+Restoration uses new connections and attachment resources. The outgoing
+attachment follows the [ordinary cleanup procedure](#errors-detachment-and-shutdown).
 
 ### Enabled UI extensions
 
@@ -420,7 +447,7 @@ Completion means Neovim accepted the input, not that it executed every key.
 Cancelling a call does not retract accepted input. Keep the application's input
 command order when scheduling these futures.
 
-Nauvim accepts mouse input for GUI actions. It must not send Neovim mouse events
+Accept mouse input for GUI actions. Do not send Neovim mouse events
 through `Client::mouse()`, encoded input sequences, or other Neovim mouse-input
 facilities. This restriction applies regardless of `State::mouse_enabled` or the
 host's `mouse` option. Clicking GUI controls can instead invoke actions such as
@@ -687,5 +714,5 @@ See [development and validation](development.md) for those checks and the
 requirements of the optional live integration suites.
 
 [spec]: https://github.com/nauvim/nauvim-spec/blob/v1.0.1/specification.md
-[ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.0/nvim_rpc_ui/
+[ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.3/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/
