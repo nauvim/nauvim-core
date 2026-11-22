@@ -84,6 +84,7 @@ impl Attempt {
         #[cfg(not(feature = "ssh"))]
         let is_remote =
             alias.is_some_and(|alias| self.config.hosts.get(alias).is_none_or(|h| h.remote));
+        let reuse_only = checkpoint.is_some();
         let (transport, _policies, _remote) = if is_remote {
             #[cfg(feature = "ssh")]
             {
@@ -91,7 +92,7 @@ impl Attempt {
 
                 let alias =
                     alias.ok_or_else(|| Error::Message("Missing remote host alias".into()))?;
-                let (transport, remote) = ssh::open(&self.config, alias).await?;
+                let (transport, remote) = ssh::open(&self.config, alias, reuse_only).await?;
                 let policies = self
                     .config
                     .hosts
@@ -107,7 +108,7 @@ impl Attempt {
                 ));
             }
         } else {
-            let (transport, policies) = self.open_local(alias).await?;
+            let (transport, policies) = self.open_local(alias, reuse_only).await?;
             (transport, policies, None::<RemoteMarker>)
         };
         let (events_tx, events) = mpsc::unbounded_channel();
@@ -305,7 +306,11 @@ impl Attempt {
         Ok(())
     }
 
-    async fn open_local(&mut self, alias: Option<&str>) -> Result<(Transport, Policies), Error> {
+    async fn open_local(
+        &self,
+        alias: Option<&str>,
+        reuse_only: bool,
+    ) -> Result<(Transport, Policies), Error> {
         use crate::HostInfo;
         use crate::socket;
 
@@ -343,6 +348,12 @@ impl Attempt {
             .map_err(|_| Error::Timeout("Socket staleness check"))??
         {
             return Ok((Transport::local(stream), policies));
+        }
+        if reuse_only {
+            return Err(Error::Message(format!(
+                "Reattach to Neovim at {}: no running session",
+                path.display()
+            )));
         }
         if host.socket.is_some()
             && let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty())

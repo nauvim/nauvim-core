@@ -442,7 +442,7 @@ async fn live_restores_checkpoints_when_reattaching_and_switching_owned_hosts() 
     assert_eq!(next_welcome(&mut engine).await, None);
 
     engine
-        .connect_with_checkpoint("local_host", 80, 24, checkpoint)
+        .connect_with_checkpoint("local_host", 80, 24, checkpoint.clone())
         .await
         .unwrap();
     let client = engine.client().unwrap();
@@ -454,6 +454,16 @@ async fn live_restores_checkpoints_when_reattaching_and_switching_owned_hosts() 
         .await
         .unwrap();
     assert_eq!(next_welcome(&mut engine).await, None);
+    let error = engine
+        .connect_with_checkpoint("local_host", 80, 24, checkpoint)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.ends_with("no running session"), "{error}");
+    assert_eq!(next_welcome(&mut engine).await, Some(error));
+    assert!(engine.client().is_none());
+    assert!(!socket.exists());
+
     engine.connect("local_host", 80, 24).await.unwrap();
     assert_ne!(pid(&engine.client().unwrap()).await, host_pid);
     assert_no_markers(&next_frame(&mut engine).await);

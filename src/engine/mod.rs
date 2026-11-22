@@ -312,8 +312,10 @@ impl Engine {
     /// Applies startup host selection with a caller-supplied checkpoint.
     ///
     /// Uses the selection rules of [`Self::start()`]. Supply a checkpoint for
-    /// the same running Neovim process that the configuration selects. If there
-    /// is no startup selection, opens the welcome page.
+    /// the same running Neovim process that the configuration selects. A
+    /// selected host follows the reattachment rules of
+    /// [`Self::connect_with_checkpoint()`]. If there is no startup selection,
+    /// opens the welcome page.
     pub async fn start_with_checkpoint(
         &mut self,
         width: u32,
@@ -366,11 +368,12 @@ impl Engine {
             .await
     }
 
-    /// Attaches to a host alias with a caller-supplied display checkpoint.
+    /// Reattaches to a host alias with a caller-supplied display checkpoint.
     ///
     /// Supply a checkpoint for the same running Neovim process. The receiving
     /// UI model applies it before attachment and the first frame requests a
-    /// full repaint. Attachment failures follow [`Self::connect()`].
+    /// full repaint. If the selected socket has no running session, returns a
+    /// connection error. Attachment failures follow [`Self::connect()`].
     pub async fn connect_with_checkpoint(
         &mut self,
         alias: &str,
@@ -387,7 +390,7 @@ impl Engine {
         self.connect_selection(None, width, height, None).await
     }
 
-    /// Attaches to the default local host with a caller-supplied checkpoint.
+    /// Reattaches to the default local host with a caller-supplied checkpoint.
     ///
     /// Uses the same checkpoint and frame contract as
     /// [`Self::connect_with_checkpoint()`].

@@ -314,12 +314,16 @@ and `Checkpoint::decode()` to convert between checkpoints and bytes. See the
 
 Supply the checkpoint to `Engine::connect_with_checkpoint()` for a host alias,
 `Engine::connect_default_with_checkpoint()` for the default local host, or
-`Engine::start_with_checkpoint()` for automatic startup selection. The engine
-passes it to `nvim-rpc-ui` before attaching the UI. A validation error follows
-the regular connection failure path.
+`Engine::start_with_checkpoint()` for automatic startup selection. These
+methods reattach to a running Neovim. A missing session or an invalid
+checkpoint follows the regular connection failure path. Use the ordinary
+connection methods to start a fresh session. The engine passes an accepted
+checkpoint to `nvim-rpc-ui` before attaching the UI.
 
 The first frame of a restored attachment requests a full repaint. Present it
 through the ordinary frame path. Its events come from the new attachment.
+Restoration uses new connections and attachment resources. The outgoing
+attachment follows the [ordinary cleanup procedure](#errors-detachment-and-shutdown).
 
 ### Enabled UI extensions
 

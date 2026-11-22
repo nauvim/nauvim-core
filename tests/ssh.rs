@@ -570,7 +570,7 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
 
         let mut engine = Engine::new(server.config("remote", Some(&server.socket))).unwrap();
         engine
-            .connect_with_checkpoint("remote", 60, 16, checkpoint)
+            .connect_with_checkpoint("remote", 60, 16, checkpoint.clone())
             .await
             .unwrap();
         let client = engine.client().unwrap();
@@ -578,6 +578,33 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         wait_setup(&client, engine.client_id()).await;
         let grids = restored_grids(&mut engine).await;
         revisit_inactive_tab(&mut engine, &client, &grids).await;
+        let detachments = server.log().matches("Nauvim detached").count();
+        let process_dir = engine.temp_dir().to_path_buf();
+        #[cfg(feature = "plugin-local-forward")]
+        let forward_path = {
+            let socket_name = "detach-forward.sock";
+            let path = process_dir.join(socket_name);
+            let target = server.root.path().join("detach-target.sock");
+            let _listener = UnixListener::bind(&target).unwrap();
+            integer(
+                &client,
+                &format!(
+                    "return nauvim_request('local-forward.open_socket', {}, {})",
+                    lua_string(socket_name),
+                    lua_string(target.to_str().unwrap()),
+                ),
+            )
+            .await;
+            timeout(Duration::from_secs(5), async {
+                while !path.exists() {
+                    sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the forward did not open before detachment");
+            path
+        };
+
         let _ = client.command("detach").await;
         assert_eq!(
             welcome(&mut engine).await,
@@ -585,6 +612,18 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
             "Host :detach is a graceful UI departure"
         );
         assert!(engine.client().is_none());
+        assert!(engine.checkpoint().is_none());
+        assert!(process_dir.is_dir());
+        timeout(Duration::from_secs(5), async {
+            while server.log().matches("Nauvim detached").count() <= detachments {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("host :detach did not close the SSH connection");
+        #[cfg(feature = "plugin-local-forward")]
+        assert!(!forward_path.exists());
+
         engine.connect("remote", 60, 16).await.unwrap();
         let client = engine.client().unwrap();
         assert_eq!(integer(&client, "return vim.fn.getpid()").await, pid);
@@ -595,6 +634,15 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
             None,
             "Host :qa! is a graceful shutdown"
         );
+        let error = engine
+            .connect_with_checkpoint("remote", 60, 16, checkpoint)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.ends_with("no running session"), "{error}");
+        assert_eq!(welcome(&mut engine).await, Some(error));
+        assert!(engine.client().is_none());
+        assert!(!server.socket.exists());
         engine.shutdown().await.unwrap();
         server.host_pid = None;
 
