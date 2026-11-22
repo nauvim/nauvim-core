@@ -234,6 +234,7 @@ actions.
 | `Error(message)` | Display a client error. This event alone does not end an attachment. |
 | `OpenWebview` | Begin creating the requested GUI window and retain its `WebviewWindow` by resource handle. |
 | `FocusWebview { handle }` | Focus the window if it is still open and focusable. |
+| `NavigateWebview` | Navigate the selected open window using the requested history and focus options. |
 | `CloseWebview { handle }` | Close that presentation if it exists; tolerate a handle with no local window. |
 | `Shutdown` | Finish application finalization, including an awaited `shutdown()`, then exit. |
 
@@ -252,10 +253,15 @@ loop {
         EngineEvent::Welcome { error } => ui.show_welcome(error),
         EngineEvent::Connect { host } => ui.show_connecting(host),
         EngineEvent::Error(message) => ui.show_error(message),
-        EngineEvent::OpenWebview { handle, url, position, focus, focusable, window } => {
-            ui.open_webview(handle, url, position, focus, focusable, window);
+        EngineEvent::OpenWebview {
+            handle, url, position, focus, focusable, close_on_blur, window,
+        } => {
+            ui.open_webview(handle, url, position, focus, focusable, close_on_blur, window);
         }
         EngineEvent::FocusWebview { handle } => ui.focus_webview(handle),
+        EngineEvent::NavigateWebview { handle, url, replace_history, focus, window } => {
+            ui.navigate_webview(handle, url, replace_history, focus, window);
+        }
         EngineEvent::CloseWebview { handle } => ui.close_webview(handle),
         EngineEvent::Shutdown => break,
     }
@@ -503,20 +509,45 @@ registration by `ResourceHandle`.
    including every redirect. Block the target when the check returns `false`.
    Core checks the opening attachment's policy and reports a denial through
    `EngineEvent::Error`.
-2. Apply `focusable` to the toolkit window. Call `WebviewWindow::opened()` when
-   the window exists. If it returns `false`, dispose of the window. Otherwise,
-   focus it immediately if both `focus` and `focusable` are true.
-3. On `FocusWebview`, find the window by handle and recheck
+2. Before opening the window, enable available developer tools or console
+   settings in the presentation component. Start with the tools hidden and
+   let the user open them through the component's usual mechanism.
+3. Apply `focusable` to the toolkit window. Call `WebviewWindow::opened()` once
+   the window exists and can accept navigation. If it returns `false`, dispose
+   of the window. Otherwise, focus it immediately if both `focus` and
+   `focusable` are true.
+4. On `FocusWebview`, find the window by handle and recheck
    `WebviewWindow::can_focus()` before moving focus. If moving focus fails,
    call `WebviewWindow::report_error()` and leave the window open. Use the same
    reporting method for creation or load failures.
-4. On `CloseWebview`, close the presentation or cancel outstanding creation
-   for that handle. Handle closure idempotently. Call `WebviewWindow::closed()`
-   when the toolkit closes the window or creation fails.
+5. On `CloseWebview`, close the presentation or cancel outstanding creation
+   for that handle. Handle closure idempotently. If `close_on_blur` is true
+   and the toolkit reports loss of focus, run the same window cleanup
+   immediately. Call `WebviewWindow::closed()` when closing the window or when
+   creation fails.
 
 A request for a missing grid returns a handle without emitting `OpenWebview`.
 A plugin clear or focus notification has no effect on a window whose creation
 is still pending. Attachment cleanup cancels pending creation.
+
+### Navigating an open window
+
+Core checks that the window is open and applies its opening attachment's
+origin policy before emitting `NavigateWebview`. When handling the event,
+check `WebviewWindow::can_navigate()` and the toolkit's availability. If the
+window is unavailable, report a client error through
+`WebviewWindow::report_error()` and discard the event. Start allowed navigation
+without waiting for the window to become available. Continue to use
+`WebviewWindow::allows_navigation()` before accessing each top-level target,
+including redirects.
+
+Replace the current history entry if `replace_history` is true. Use the
+presentation component's normal history behaviour otherwise. Keep the existing
+navigation and history entry when an identical request is already in progress
+or still in effect. If `focus` is true, request focus only after the component
+accepts navigation and `WebviewWindow::can_focus()` is still true. Report navigation,
+history replacement and focus errors through `WebviewWindow::report_error()`. Leave
+the window open in the state left by the failed operation.
 
 `WebviewPosition` uses cells of its named grid, with a zero-based upper-left
 origin. Increasing `left` moves right; increasing `top` moves down. Convert its
@@ -655,6 +686,6 @@ The core's own tests validate engine behaviour, not your toolkit adapter.
 See [development and validation](development.md) for those checks and the
 requirements of the optional live integration suites.
 
-[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.0.0/specification.md
+[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.0.1/specification.md
 [ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.0/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/
