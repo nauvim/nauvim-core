@@ -58,9 +58,52 @@ The `work` host also reads the selected OpenSSH configuration source for setting
 absent from its native SSH table. The default source is `$HOME/.ssh/config`.
 Required source errors fail the connection attempt.
 
-The implemented host `policies` table accepts Boolean `local_forward`,
-`filesystem`, `http`, and `clipboard` permissions. Omitted permissions are enabled;
-false denies that operation. This policy format is provisional.
+## Host plugin permissions
+
+Set permissions for each host under `hosts[alias].policies.plugin`. Omitted, nil,
+and empty policies grant no permissions. This includes the default local host
+and destinations resolved only through OpenSSH. Configuration loading validates
+the permissions for every configured host.
+
+```lua
+policies = {
+    plugin = {
+        filesystem = { copy = true },
+        http = {
+            serve_file = true,
+            open_webview = {
+                origins = { "https://docs.example.com" },
+                served_files = true,
+            },
+        },
+        local_forward = {
+            tcp = { { client_port = 0, host_addr = "localhost", host_port = 8080 } },
+            socket = {
+                { client_socket_path = "preview.sock", host_socket_path = "/run/preview.sock" },
+            },
+        },
+        clipboard = { copy = true },
+    },
+}
+```
+
+- `filesystem.copy` permits copies into the process temporary directory.
+  `http.serve_file` permits serving files from that directory.
+- `http.open_webview.origins` permits an explicit list of HTTP(S) origins or
+  `"all"`. Write each origin as `scheme://host` or `scheme://host:port`. Matching
+  uses the scheme, host, and effective port. With `served_files = true`, the
+  Webview can also access active file servers started by the same attachment,
+  including servers with ports assigned by the operating system.
+- `local_forward.tcp` matches the client port, host address, and host port
+  exactly. A client port of `0` requests an operating-system-assigned port.
+  `local_forward.socket` matches the resolved client path relative to the
+  process temporary directory and the supplied absolute host socket path.
+  Either setting can use `"all"` to allow all valid requests of its type.
+- `clipboard.copy` permits host-initiated writes to the client clipboard.
+
+Denied requests return an error to the plugin. Denied notifications report an
+error in Nauvim. Handle queries, cleanup, Webview focus, and GUI paste follow
+their ordinary rules.
 
 ## Selecting a startup host
 
@@ -108,7 +151,10 @@ Nauvim appends `"--headless", "--listen", socket` immediately after `args`.
 A string-valued `nvim` has no configured arguments. Program executability is
 checked by launching it, rather than by a separate validation step.
 
-A wrapper must forward the appended arguments to Neovim. For example:
+Every new host process receives `NAUVIM_CONNECTION=local` or
+`NAUVIM_CONNECTION=ssh`. Core's value overrides inherited and configured
+values, including entries in `nvim.env`. A wrapper must pass this value and
+the appended arguments through to Neovim.
 
 ```lua
 nvim = {
@@ -144,7 +190,8 @@ have a five-second timeout and attachment has a twenty-second timeout.
 
 Global `ssh.config` and `ssh.known_hosts` select the client-side OpenSSH source
 and trust file. Their defaults are `$HOME/.ssh/config` and
-`$HOME/.ssh/known_hosts`. Supplied paths must be non-empty absolute paths.
+`$HOME/.ssh/known_hosts`. Omit the global `ssh` table or set it to nil to use
+both defaults. Supplied paths must be non-empty absolute paths.
 
 A host's native `ssh` table accepts `host_name`, `user`, `port`, `identity_file`,
 `certificate_file`, `identity_agent`, `identities_only`, `proxy_jump`,
@@ -198,8 +245,8 @@ The host-side provider needs no clipboard utility. Attachment cleanup stops
 foreground clipboard owners; clipboard persistence afterward depends on the
 client desktop environment.
 
-Bind GUI paste actions to `Engine::paste()`. The host's `clipboard` policy
-applies to GUI paste and plugin copy notifications. See
+Bind GUI paste actions to `Engine::paste()`. Host-initiated clipboard writes
+require the host's `policies.plugin.clipboard.copy` permission. See
 [clipboard and GUI paste](implementors.md#clipboard-and-gui-paste) for input,
 event-loop, and error-handling contracts.
 

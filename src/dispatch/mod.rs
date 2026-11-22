@@ -97,28 +97,33 @@ impl Dispatch {
         match method {
             #[cfg(feature = "plugin-local-forward")]
             b"nauvim-plugin/local-forward.open_tcp" => {
-                allowed(self.policies.local_forward)?;
                 let port = next(&mut params)?;
                 let addr = next(&mut params)?;
                 let host_port = next(&mut params)?;
                 end(&params)?;
                 Ok(handle_reply(
-                    self.resources.open_tcp(port, addr, host_port).await?,
+                    self.resources
+                        .open_tcp_checked(port, addr, host_port, |port, addr, host_port| {
+                            allowed(self.policies.allows_tcp(port, addr, host_port))
+                        })
+                        .await?,
                 ))
             }
             #[cfg(feature = "plugin-local-forward")]
             b"nauvim-plugin/local-forward.open_socket" => {
-                allowed(self.policies.local_forward)?;
                 let client = next(&mut params)?;
                 let host = next(&mut params)?;
                 end(&params)?;
                 Ok(handle_reply(
-                    self.resources.open_socket(client, host).await?,
+                    self.resources
+                        .open_socket_checked(client, host, |client, host| {
+                            allowed(self.policies.allows_socket(client, host))
+                        })
+                        .await?,
                 ))
             }
             #[cfg(feature = "plugin-local-forward")]
             b"nauvim-plugin/local-forward.get_port" => {
-                allowed(self.policies.local_forward)?;
                 let handle = ResourceHandle::from(next::<i64>(&mut params)?);
                 end(&params)?;
                 Ok(self
@@ -129,7 +134,7 @@ impl Dispatch {
             }
             #[cfg(feature = "plugin-filesystem")]
             b"nauvim-plugin/filesystem.copy" => {
-                allowed(self.policies.filesystem)?;
+                allowed(self.policies.filesystem_copy)?;
                 let client = next(&mut params)?;
                 let host = next(&mut params)?;
                 let overwrite = next(&mut params)?;
@@ -140,7 +145,7 @@ impl Dispatch {
             }
             #[cfg(feature = "plugin-http")]
             b"nauvim-plugin/http.serve_file" => {
-                allowed(self.policies.http)?;
+                allowed(self.policies.http_serve_file)?;
                 let file = next(&mut params)?;
                 let port = next(&mut params)?;
                 let https = next(&mut params)?;
@@ -152,7 +157,6 @@ impl Dispatch {
             }
             #[cfg(feature = "plugin-http")]
             b"nauvim-plugin/http.get_port" => {
-                allowed(self.policies.http)?;
                 let handle = ResourceHandle::from(next::<i64>(&mut params)?);
                 end(&params)?;
                 Ok(self
@@ -169,13 +173,14 @@ impl Dispatch {
 
                 use url::Url;
 
-                allowed(self.policies.http)?;
                 let url: String = next(&mut params)?;
                 let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
                 if !matches!(parsed.scheme(), "http" | "https") || parsed.host().is_none() {
                     return Err("Webview URL must use http or https".into());
                 }
                 let mut map: Map = next(&mut params)?;
+                let focus = webview_flag(&mut params)?;
+                let focusable = webview_flag(&mut params)?;
                 end(&params)?;
                 let mut grid = None;
                 let mut top = None;
@@ -242,19 +247,31 @@ impl Dispatch {
                     height: height.ok_or("Missing position.height")?,
                     width: width.ok_or("Missing position.width")?,
                 };
-                let handle = self.resources.reserve().await?;
-                if self
+                let navigation = self
+                    .resources
+                    .webview_navigation(self.policies.webview.clone());
+                allowed(navigation.allows_url(&parsed))?;
+
+                let grid_exists = self
                     .grids
                     .read()
                     .unwrap_or_else(|e| e.into_inner())
-                    .contains(&position.grid)
-                {
+                    .contains(&position.grid);
+                let (handle, window) = self
+                    .resources
+                    .reserve_webview(navigation, focusable)
+                    .await?;
+                if grid_exists {
                     let _ = self.events.send(EngineEvent::OpenWebview {
                         handle,
                         url,
                         position,
+                        focus,
+                        focusable,
+                        window,
                     });
                 }
+
                 Ok(handle_reply(handle))
             }
             _ => Err("Unknown or disabled Nauvim request".into()),
@@ -274,7 +291,7 @@ impl Dispatch {
             }
             #[cfg(feature = "plugin-clipboard")]
             b"nauvim-plugin/clipboard.copy" => {
-                allowed(self.policies.clipboard)?;
+                allowed(self.policies.clipboard_copy)?;
                 let register: String = next(&mut params)?;
                 if !matches!(register.as_str(), "+" | "*") {
                     return Err("Clipboard register must be + or *".into());
@@ -297,6 +314,14 @@ impl Dispatch {
                 let h = ResourceHandle::from(next::<i64>(&mut params)?);
                 end(&params)?;
                 self.resources.clear_copy(h).await;
+            }
+            #[cfg(feature = "plugin-http")]
+            b"nauvim-plugin/http.focus_webview" => {
+                let handle = ResourceHandle::from(next::<i64>(&mut params)?);
+                end(&params)?;
+                if self.resources.can_focus_webview(handle).await {
+                    let _ = self.events.send(EngineEvent::FocusWebview { handle });
+                }
             }
             #[cfg(feature = "plugin-http")]
             b"nauvim-plugin/http.clear" => {
@@ -387,6 +412,18 @@ fn validate_params(params: &Array) -> Result<(), String> {
 
 fn next<T: Decode<types::Object, Bytes>>(params: &mut Array) -> Result<T, String> {
     T::decode(params.next().ok_or("Missing RPC argument")?).map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "plugin-http")]
+fn webview_flag(params: &mut Array) -> Result<bool, String> {
+    use nvim_rpc_plugin::mp::decode::Object;
+
+    match params.next() {
+        None | Some(Object::Nil) => Ok(true),
+        Some(value) => {
+            <bool as Decode<types::Object, Bytes>>::decode(value).map_err(|e| e.to_string())
+        }
+    }
 }
 
 fn is_addressed_to(params: &mut Array, client_id: ClientId) -> bool {

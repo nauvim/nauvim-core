@@ -1,3 +1,5 @@
+#[cfg(feature = "plugin-http")]
+use crate::WebviewWindow;
 use crate::connection::Connection;
 #[cfg(feature = "ssh")]
 use crate::resources::Remote;
@@ -55,6 +57,17 @@ pub enum EngineEvent {
         handle: ResourceHandle,
         url: String,
         position: WebviewPosition,
+        /// Whether to focus the window immediately after opening if focusable.
+        focus: bool,
+        /// Whether the window can receive focus.
+        focusable: bool,
+        /// The frontend's navigation check and window lifecycle token.
+        #[cfg(feature = "plugin-http")]
+        window: WebviewWindow,
+    },
+    /// Focuses an open and focusable plugin window through the frontend.
+    FocusWebview {
+        handle: ResourceHandle,
     },
     CloseWebview {
         handle: ResourceHandle,
@@ -72,8 +85,6 @@ struct Attachment {
     host_detach: Arc<AtomicBool>,
     #[cfg(feature = "plugin-clipboard")]
     clipboard: Arc<Clipboard>,
-    #[cfg(feature = "plugin-clipboard")]
-    clipboard_enabled: bool,
     #[cfg(feature = "ssh")]
     remote: Option<Remote>,
 }
@@ -224,26 +235,18 @@ impl Engine {
     /// The returned future owns its attachment handles, so it can run alongside
     /// [`Self::next_event()`]. It remains addressed to the attachment selected
     /// when this method was called. Failures are returned and reported through
-    /// [`EngineEvent::Error`], including missing attachments and policy denials.
+    /// [`EngineEvent::Error`].
     #[cfg(feature = "plugin-clipboard")]
     pub fn paste(&self) -> impl Future<Output = Result<bool, Error>> + Send + use<> {
-        let active = self.active.as_ref().map(|active| {
-            (
-                active.rpc.client.clone(),
-                Arc::clone(&active.clipboard),
-                active.clipboard_enabled,
-            )
-        });
+        let active = self
+            .active
+            .as_ref()
+            .map(|active| (active.rpc.client.clone(), Arc::clone(&active.clipboard)));
         let errors = self.errors_tx.clone();
         async move {
             let result = async {
-                let (client, clipboard, enabled) =
+                let (client, clipboard) =
                     active.ok_or_else(|| Error::Message("No host Neovim is attached".into()))?;
-                if !enabled {
-                    return Err(Error::Message(
-                        "Client policy denies clipboard access".into(),
-                    ));
-                }
                 let text = clipboard.read("+").await.map_err(Error::Message)?;
                 client.paste(&text).await.map_err(Error::from)
             }
@@ -567,7 +570,7 @@ impl Engine {
             while let Ok(event) = active.events.try_recv() {
                 match event {
                     EngineEvent::Connect { host: destination } => host = Some(destination),
-                    EngineEvent::OpenWebview { .. } => {}
+                    EngineEvent::OpenWebview { .. } | EngineEvent::FocusWebview { .. } => {}
                     event => self.queued.push_back(event),
                 }
             }
@@ -728,46 +731,6 @@ mod tests {
         engine.shutdown().await.unwrap();
     }
 
-    #[cfg(feature = "plugin-clipboard")]
-    #[tokio::test]
-    async fn paste_policy_denial_precedes_backend_or_host_access() {
-        let mut engine = Engine::new(Config::default()).unwrap();
-        engine.pending_errors.clear();
-        engine.ensure_runtime().unwrap();
-        let (stream, _peer) = UnixStream::pair().unwrap();
-        let (rdr, wtr) = split(Transport::local(stream));
-        let rpc = connection::connect(
-            rdr,
-            wtr,
-            NoHandler,
-            ConnectionOptions::default(),
-            #[cfg(feature = "plugin-http")]
-            Grids::default(),
-        )
-        .unwrap();
-        let (_, events) = mpsc::unbounded_channel();
-        engine.active = Some(Attachment {
-            rpc,
-            resources: Arc::new(Resources::new(
-                engine.temp_path.clone(),
-                engine.errors_tx.clone(),
-            )),
-            events,
-            setup: None,
-            host_quit: Arc::new(AtomicBool::new(false)),
-            host_detach: Arc::new(AtomicBool::new(false)),
-            clipboard: Arc::clone(&engine.clipboard),
-            clipboard_enabled: false,
-            #[cfg(feature = "ssh")]
-            remote: None,
-        });
-        let error = engine.paste().await.unwrap_err();
-        assert_eq!(error.to_string(), "Client policy denies clipboard access");
-        assert_eq!(engine.errors.try_recv().unwrap(), error.to_string());
-        engine.release(false);
-        engine.shutdown().await.unwrap();
-    }
-
     #[tokio::test]
     async fn retains_connection_progress_when_event_receive_is_cancelled() {
         use tokio::sync::Notify;
@@ -879,8 +842,6 @@ mod tests {
             host_detach: Arc::new(AtomicBool::new(true)),
             #[cfg(feature = "plugin-clipboard")]
             clipboard: Arc::clone(&engine.clipboard),
-            #[cfg(feature = "plugin-clipboard")]
-            clipboard_enabled: true,
             #[cfg(feature = "ssh")]
             remote: None,
         });
@@ -1007,8 +968,6 @@ mod tests {
                 host_detach: Arc::new(AtomicBool::new(false)),
                 #[cfg(feature = "plugin-clipboard")]
                 clipboard: Arc::clone(&engine.clipboard),
-                #[cfg(feature = "plugin-clipboard")]
-                clipboard_enabled: true,
                 #[cfg(feature = "ssh")]
                 remote: None,
             });

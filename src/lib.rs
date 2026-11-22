@@ -52,6 +52,8 @@ mod error;
 pub use error::Error;
 pub mod resources;
 pub use resources::ResourceHandle;
+#[cfg(feature = "plugin-http")]
+pub use resources::WebviewWindow;
 mod transport;
 pub use transport::Transport;
 mod dispatch;

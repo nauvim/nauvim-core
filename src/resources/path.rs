@@ -75,16 +75,26 @@ fn components(path: &Path) -> impl DoubleEndedIterator<Item = &OsStr> {
         .chain((bytes.last() == Some(&b'/')).then_some(OsStr::new(".")))
 }
 
+#[cfg(any(
+    test,
+    feature = "plugin-local-forward",
+    feature = "plugin-filesystem",
+    feature = "plugin-http"
+))]
 pub(super) fn descendant(base: &Path, path: &Path) -> io::Result<PathBuf> {
+    descendant_with_base(base, path).map(|(path, _)| path)
+}
+
+pub(super) fn descendant_with_base(base: &Path, path: &Path) -> io::Result<(PathBuf, PathBuf)> {
     let base = fs::canonicalize(base)?;
     let path = resolve(path)?;
-    if path == base || !path.starts_with(base) {
+    if path == base || !path.starts_with(&base) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Client path must be a strict descendant of the process temporary directory",
         ));
     }
-    Ok(path)
+    Ok((path, base))
 }
 
 pub(super) fn valid_string(value: &str) -> Result<(), String> {

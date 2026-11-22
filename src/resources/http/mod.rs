@@ -1,5 +1,11 @@
 mod wire;
 use wire::OriginIo;
+mod webview;
+use webview::WebviewNavigation;
+pub use webview::WebviewWindow;
+pub(super) use webview::{ServedOrigins, Window};
+
+use crate::config::WebviewPolicy;
 
 use super::{Binding, Data, Kind, Resource, ResourceHandle, Resources};
 
@@ -158,6 +164,7 @@ impl Resources {
         );
         let stop = resource.stop.clone();
         let errors = self.errors.clone();
+        let origins = Arc::clone(&self.served_origins);
         resource.task = Some(spawn(async move {
             if stop.is_cancelled() {
                 return;
@@ -185,6 +192,7 @@ impl Resources {
                     Err(e) => { binding.send_replace(Binding::Failed(e.clone())); let _ = errors.send(e); return; }
                 }
             };
+            let active_origin = origins.register(https, port, stop.clone());
             binding.send_replace(Binding::Ready(port));
             let scheme = if https { "https" } else { "http" };
             let origin = format!("{scheme}://127.0.0.1:{port}");
@@ -216,6 +224,8 @@ impl Resources {
                     },
                 }
             }
+            drop(active_origin);
+            drop(listener);
             clients.abort_all();
             while clients.join_next().await.is_some() {}
         }));
@@ -229,18 +239,62 @@ impl Resources {
         self.port(handle, Kind::Http).await
     }
 
-    /// Cancels server startup or closes the HTTP listener and active clients.
+    pub(crate) fn webview_navigation(&self, policy: WebviewPolicy) -> WebviewNavigation {
+        WebviewNavigation::new(policy, Arc::clone(&self.served_origins))
+    }
+
+    pub(crate) async fn reserve_webview(
+        &self,
+        navigation: WebviewNavigation,
+        focusable: bool,
+    ) -> Result<(ResourceHandle, WebviewWindow), String> {
+        let window = WebviewWindow::new(
+            navigation,
+            self.stop.clone(),
+            self.errors.clone(),
+            focusable,
+        );
+        let resource = Resource::new(
+            Data::Webview(Arc::downgrade(&window.0)),
+            &self.stop,
+            &self.owner,
+        );
+        let handle = self.insert(resource).await?;
+        Ok((handle, window))
+    }
+
+    pub(crate) async fn can_focus_webview(&self, handle: ResourceHandle) -> bool {
+        let state = self.registry.state.lock().await;
+        let Some(Resource {
+            data: Data::Webview(window),
+            ..
+        }) = state.entries.get(&handle)
+        else {
+            return false;
+        };
+
+        window.upgrade().is_some_and(|window| window.can_focus())
+    }
+
+    /// Cancels server startup, closes the HTTP listener or clears an open window.
     ///
-    /// Returns whether a window association was removed. The application must
-    /// close that window through its backend when this returns `true`.
+    /// Returns whether a window association was removed. Close that window
+    /// through the frontend when this returns `true`.
     pub async fn clear_http(&self, handle: ResourceHandle) -> bool {
-        if let Some(resource) = self.take(handle, &[Kind::Http, Kind::Reserved]).await {
-            let window = resource.data.kind() == Kind::Reserved;
-            self.stop(resource).await;
-            window
-        } else {
-            false
-        }
+        let kinds = [Kind::Http, Kind::Reserved, Kind::Webview];
+        let Some(resource) = self
+            .take_if(handle, &kinds, |resource| match &resource.data {
+                Data::Webview(window) => window.upgrade().is_some_and(|window| window.close_open()),
+                _ => true,
+            })
+            .await
+        else {
+            return false;
+        };
+
+        let window = matches!(resource.data, Data::Reserved | Data::Webview(_));
+        self.stop(resource).await;
+        window
     }
 
     /// Returns handles for windows associated with this attachment.
@@ -252,9 +306,17 @@ impl Resources {
             .entries
             .iter()
             .filter_map(|(handle, resource)| {
-                (Arc::ptr_eq(&resource.owner, &self.owner)
-                    && resource.data.kind() == Kind::Reserved)
-                    .then_some(*handle)
+                if !Arc::ptr_eq(&resource.owner, &self.owner) {
+                    return None;
+                }
+                let associated = match &resource.data {
+                    Data::Reserved => true,
+                    Data::Webview(window) => window
+                        .upgrade()
+                        .is_some_and(|window| window.is_associated()),
+                    _ => false,
+                };
+                associated.then_some(*handle)
             })
             .collect()
     }
@@ -871,6 +933,80 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn navigation_consults_active_file_servers_from_its_own_attachment() {
+        use crate::Policies;
+
+        use mlua::Lua;
+
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("file"), b"test").await.unwrap();
+        let (errors, mut messages) = mpsc::unbounded_channel();
+        let first = Resources::new(dir.path().to_owned(), errors.clone());
+        let other = Resources::with_registry(
+            dir.path().to_owned(),
+            errors,
+            Arc::clone(&first.handles),
+            Arc::clone(&first.registry),
+        );
+        let lua = Lua::new();
+        let config = lua
+            .load(
+                r#"return {plugin = {http = {open_webview = {
+                origins = {"https://docs.example.test"}, served_files = true,
+            }}}}"#,
+            )
+            .eval()
+            .unwrap();
+        let policy = Policies::parse(Some(config)).unwrap().webview;
+        let (_, window) = first
+            .reserve_webview(first.webview_navigation(policy.clone()), true)
+            .await
+            .unwrap();
+        let (_, other_window) = other
+            .reserve_webview(other.webview_navigation(policy), true)
+            .await
+            .unwrap();
+
+        assert!(window.allows_navigation("https://docs.example.test:443/start"));
+        assert!(window.opened());
+        for (https, scheme, wrong_scheme) in [(false, "http", "https"), (true, "https", "http")] {
+            let server = first
+                .serve_file("file".to_owned(), 0, https, false)
+                .await
+                .unwrap();
+            let port = timeout(Duration::from_secs(5), first.get_http_port(server))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let url = format!("{scheme}://127.0.0.1:{port}/redirect#fragment");
+            assert!(window.allows_navigation(&url));
+            for (window, url) in [
+                (&other_window, url.clone()),
+                (&window, format!("{wrong_scheme}://127.0.0.1:{port}/")),
+                (&window, format!("{scheme}://localhost:{port}/")),
+            ] {
+                assert!(!window.allows_navigation(&url));
+                assert_eq!(
+                    messages.try_recv().unwrap(),
+                    format!("Client policy denies Webview navigation to {url:?}")
+                );
+            }
+
+            first.clear_http(server).await;
+            assert!(!window.allows_navigation(&url));
+            assert_eq!(
+                messages.try_recv().unwrap(),
+                format!("Client policy denies Webview navigation to {url:?}")
+            );
+        }
+        first.cleanup().await;
+        other.cleanup().await;
+        assert!(!window.allows_navigation("https://docs.example.test/after-cleanup"));
+        assert!(messages.try_recv().is_err());
     }
 
     #[tokio::test]

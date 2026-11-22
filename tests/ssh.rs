@@ -192,6 +192,12 @@ LogLevel DEBUG2
 
     fn config(&self, socket: &Path) -> Config {
         let startup = r#"lua package.preload['nauvim-plugin.client']=function() return {setup=function(opts) _G.nauvim_ssh_setup=opts.client_id end} end; _G.nauvim_request=function(method,...) return vim.rpcrequest(vim.api.nvim_list_uis()[1].chan,'nauvim-plugin/'..method,_G.nauvim_ssh_setup,...) end; _G.nauvim_notify=function(method,...) vim.rpcnotify(vim.api.nvim_list_uis()[1].chan,'nauvim-plugin/'..method,_G.nauvim_ssh_setup,...) end"#;
+        let init = self.root.path().join("init.lua");
+        fs::write(
+            &init,
+            "vim.g.nauvim_test_connection = os.getenv('NAUVIM_CONNECTION')",
+        )
+        .unwrap();
         let src = format!(
             r#"
 local client = require("nauvim-client-info")
@@ -204,8 +210,12 @@ local function check_host(info)
 end
 return {{
     hosts = {{ remote = {{
-        nvim = function(info) check_host(info); return {{prog = "sh", args = {{"-c", {}, "nauvim", {}, "-u", "NONE", "-i", "NONE", "-n", "--cmd", {}}}, env = {{NAUVIM_LITERAL = {}, NAUVIM_ARGV_FILE = {}}}}} end,
+        nvim = function(info) check_host(info); return {{prog = "sh", args = {{"-c", {}, "nauvim", {}, "-u", {}, "-i", "NONE", "-n", "--cmd", {}}}, env = {{NAUVIM_LITERAL = {}, NAUVIM_ARGV_FILE = {}, NAUVIM_CONNECTION = "configured"}}}} end,
         socket = function(info) check_host(info); return {} end,
+        policies = {{plugin = {{
+            filesystem = {{copy = true}},
+            local_forward = {{tcp = "all", socket = "all"}},
+        }}}},
         ssh = {{ host_name = "127.0.0.1", user = {}, port = {},
             identity_file = {}, identities_only = true,
             host_key_algorithms = {{"ssh-ed25519"}}, kex_algorithms = {{"curve25519-sha256"}},
@@ -216,6 +226,7 @@ return {{
 "#,
             lua_string(r#"printf '%s\0' "$@" > "$NAUVIM_ARGV_FILE"; exec "$@""#),
             lua_string(self.nvim.to_str().unwrap()),
+            lua_string(init.to_str().unwrap()),
             lua_string(startup),
             lua_string("literal $HOME; 'quoted' \"double\" 日本語"),
             lua_string(self.root.path().join("argv record").to_str().unwrap()),
@@ -457,6 +468,13 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
             .await
             .unwrap();
         assert_eq!(env, "literal $HOME; 'quoted' \"double\" 日本語");
+        let connection = client
+            .nvim()
+            .request::<api::NvimExecLua, String>(("return vim.g.nauvim_test_connection", ()))
+            .await
+            .unwrap();
+        assert_eq!(connection, "ssh");
+
         let recorded = fs::read(server.root.path().join("argv record")).unwrap();
         let argv: Vec<_> = recorded
             .split(|&b| b == 0)
@@ -465,9 +483,10 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
             .collect();
         assert!(argv.ends_with(&["--headless", "--listen", server.socket.to_str().unwrap()]));
         assert_eq!(argv.first().copied(), server.nvim.to_str());
+        let init = server.root.path().join("init.lua");
         assert_eq!(
             argv.get(1..7),
-            Some(&["-u", "NONE", "-i", "NONE", "-n", "--cmd"][..])
+            Some(&["-u", init.to_str().unwrap(), "-i", "NONE", "-n", "--cmd"][..])
         );
         #[cfg(feature = "plugin-local-forward")]
         forwarding(&client, server.root.path(), engine.temp_dir()).await;

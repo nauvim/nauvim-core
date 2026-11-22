@@ -410,6 +410,129 @@ fn validates_global_ssh_paths_without_accessing_them() {
     }
 }
 
+#[test]
+fn validates_plugin_policies_for_unselected_hosts() {
+    for (policy, diagnostic) in [
+        (
+            "{local_forward=true}",
+            "Unknown policies field: local_forward",
+        ),
+        ("{plugin=false}", "policies.plugin must be a table"),
+        (
+            "{plugin={[1]=true}}",
+            "policies.plugin field names must be strings",
+        ),
+        (
+            "{plugin={clipboard='yes'}}",
+            "plugin.clipboard must be a table",
+        ),
+        (
+            "{plugin={clipboard={copy=0}}}",
+            "plugin.clipboard.copy must be a Boolean",
+        ),
+        (
+            "{plugin={filesystem={copy='yes'}}}",
+            "plugin.filesystem.copy must be a Boolean",
+        ),
+        (
+            "{plugin={http={serve_file={}}}}",
+            "plugin.http.serve_file must be a Boolean",
+        ),
+        (
+            "{plugin={http={open_webview={served_files='yes'}}}}",
+            "served_files must be a Boolean",
+        ),
+        (
+            "{plugin={http={open_webview={extra=true}}}}",
+            "Unknown plugin.http.open_webview field: extra",
+        ),
+        (
+            "{plugin={local_forward={tcp='any'}}}",
+            "plugin.local_forward.tcp must be a list",
+        ),
+        (
+            "{plugin={local_forward={socket=false}}}",
+            "plugin.local_forward.socket must be a list",
+        ),
+        (
+            "{plugin={local_forward={tcp={{host_addr='example.test',host_port=80}}}}}",
+            "client_port must be an integer",
+        ),
+        (
+            "{plugin={local_forward={tcp={{client_port=65536,host_addr='example.test',host_port=80}}}}}",
+            "client_port must be an integer",
+        ),
+        (
+            "{plugin={local_forward={tcp={{client_port='0',host_addr='example.test',host_port=80}}}}}",
+            "client_port must be an integer",
+        ),
+        (
+            "{plugin={local_forward={tcp={{client_port=0,host_addr='example.test',host_port=0}}}}}",
+            "host_port must be an integer",
+        ),
+        (
+            r"{plugin={local_forward={tcp={{client_port=0,host_addr='\255',host_port=80}}}}}",
+            "host_addr must be valid UTF-8",
+        ),
+        (
+            "{plugin={local_forward={socket={{client_socket_path='/a.sock',host_socket_path='/a.sock'}}}}}",
+            "client_socket_path must be relative",
+        ),
+        (
+            "{plugin={local_forward={socket={{client_socket_path='a.sock',host_socket_path='a.sock'}}}}}",
+            "host_socket_path must be an absolute POSIX path",
+        ),
+        (
+            "{plugin={http={open_webview={origins={[2]='https://example.test'}}}}}",
+            "origins must be a list indexed consecutively from 1",
+        ),
+        (
+            "{plugin={http={open_webview={origins={example='https://example.test'}}}}}",
+            "origins must be a list indexed consecutively from 1",
+        ),
+    ] {
+        let source = format!(
+            "return {{default_host='selected', hosts={{selected={{}},unused={{policies={policy}}}}}}}"
+        );
+        let error = evaluate(&source).err().unwrap().to_string();
+        assert!(error.contains(diagnostic), "{source}: {error}");
+    }
+}
+
+#[test]
+fn validates_webview_origin_entries() {
+    for origin in [
+        "'https://example.test/'",
+        "'https://example.test/guide'",
+        "'https://example.test?q=value'",
+        "'https://example.test#section'",
+        "'https://user@example.test'",
+        "'https://:secret@example.test'",
+        "'https://example.test:'",
+        "'https://example.test:65536'",
+        "'https:// example.test'",
+        "'https:example.test'",
+        "'https:///example.test'",
+        "'ftp://example.test'",
+        "false",
+    ] {
+        let source = format!(
+            r"return {{
+                hosts = {{ unused = {{
+                    policies = {{ plugin = {{ http = {{
+                        open_webview = {{ origins = {{{origin}}} }},
+                    }}}}}},
+                }}}},
+            }}"
+        );
+        let error = evaluate(&source).err().unwrap().to_string();
+        assert!(
+            error.contains("Webview origin policy entry"),
+            "{source}: {error}"
+        );
+    }
+}
+
 fn ui_options(src: &str) -> Result<UiConfig, Error> {
     Config::evaluate(
         src,

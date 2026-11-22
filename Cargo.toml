@@ -1,6 +1,6 @@
 [package]
 name = "nauvim-core"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "UI-independent Nauvim session and plugin engine"
@@ -31,7 +31,6 @@ plugin-local-forward = []
 plugin-filesystem = []
 plugin-http = [
     "dep:bytes",
-    "dep:url",
     "dep:hyper",
     "dep:hyper-util",
     "dep:tokio-rustls",
@@ -60,7 +59,7 @@ tokio = { version = "1", features = [
 tokio-util = { version = "0.7", features = ["rt"] }
 bytes = { version = "1", optional = true }
 getrandom = "0.3"
-url = { version = "2", optional = true }
+url = "2"
 openrussh-client = { version = "0.4.6", optional = true, default-features = false, features = [
     "ring",
     "rsa",

@@ -131,8 +131,10 @@ async fn open_on(config: &Config, alias: &str, conn: &Remote) -> Result<Transpor
         .args(
             nvim.env
                 .iter()
+                .filter(|(name, _)| name.as_str() != "NAUVIM_CONNECTION")
                 .map(|(name, value)| (name.as_str(), "=", value.as_str())),
         )
+        .arg("NAUVIM_CONNECTION=ssh")
         .arg(nvim.prog.as_str())
         .args(nvim.args.iter().map(String::as_str))
         .args(["--headless", "--listen", socket.as_str()]);

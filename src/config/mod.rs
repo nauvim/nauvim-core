@@ -11,32 +11,16 @@ mod info;
 pub use info::{HostInfo, ProjectDirs};
 mod clipboard;
 pub use clipboard::ClipboardConfig;
+mod policy;
+pub use policy::Policies;
+#[cfg(feature = "plugin-http")]
+pub(crate) use policy::WebviewPolicy;
 mod ui_opts;
 pub use ui_opts::{UiConfig, UiTable, UiTableId, UiValue};
 pub(crate) mod program;
 use program::ProgramSetting;
 #[cfg(feature = "ssh")]
 pub(crate) mod ssh;
-
-/// Client resource permissions for one attachment.
-#[derive(Debug, Clone, Copy)]
-pub struct Policies {
-    pub local_forward: bool,
-    pub filesystem: bool,
-    pub http: bool,
-    pub clipboard: bool,
-}
-
-impl Default for Policies {
-    fn default() -> Self {
-        Self {
-            local_forward: true,
-            filesystem: true,
-            http: true,
-            clipboard: true,
-        }
-    }
-}
 
 pub(crate) enum Setting {
     Text(String),
@@ -283,18 +267,7 @@ impl Config {
                 if remote.is_some() {
                     validate_disabled_ssh(remote.as_ref())?;
                 }
-                let policies = match h.get::<Option<Table>>("policies")? {
-                    Some(p) => {
-                        reject_kebab(&p)?;
-                        Policies {
-                            local_forward: p.get::<Option<bool>>("local_forward")?.unwrap_or(true),
-                            filesystem: p.get::<Option<bool>>("filesystem")?.unwrap_or(true),
-                            http: p.get::<Option<bool>>("http")?.unwrap_or(true),
-                            clipboard: p.get::<Option<bool>>("clipboard")?.unwrap_or(true),
-                        }
-                    }
-                    None => Policies::default(),
-                };
+                let policies = Policies::parse(h.raw_get("policies")?)?;
                 hosts.insert(
                     alias,
                     Host {
@@ -383,6 +356,7 @@ impl Config {
     }
 }
 
+#[cfg(not(feature = "ssh"))]
 fn reject_kebab(t: &Table) -> Result<(), Error> {
     for pair in t.clone().pairs::<String, Value>() {
         let (key, _) = pair?;
@@ -479,6 +453,37 @@ fn lua_string<'a>(value: &'a mlua::String, field: &str) -> Result<BorrowedStr<'a
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn defaults_both_ssh_paths_when_global_settings_are_absent() {
+        for source in ["return {}", "return {ssh=nil}", "return {ssh={}}"] {
+            let info = HostInfo {
+                host_name: "test".into(),
+                user: "test".into(),
+                config_file: Some("/tmp/nauvim-test/init.lua".into()),
+                home_dir: "/home/nauvim-test".into(),
+                project_dirs: ProjectDirs {
+                    cache_dir: "/cache".into(),
+                    data_dir: "/data".into(),
+                    runtime_dir: "/runtime".into(),
+                },
+            };
+            let (config, ()) =
+                Config::evaluate(source, info, "org.example.nauvim.test", |_| Ok(())).unwrap();
+
+            assert_eq!(
+                config.ssh_config,
+                Path::new("/home/nauvim-test/.ssh/config"),
+                "{source}"
+            );
+            assert_eq!(
+                config.known_hosts,
+                Path::new("/home/nauvim-test/.ssh/known_hosts"),
+                "{source}"
+            );
+        }
+    }
 
     #[test]
     fn validates_socket_callback_results() {
