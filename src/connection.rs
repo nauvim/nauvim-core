@@ -2,61 +2,30 @@ use crate::Error;
 
 #[cfg(feature = "plugin-http")]
 use nvim_rpc_plugin::mp::decode::Array as DecodedArray;
-use nvim_rpc_plugin::{Array, Connection as RpcConnection, ConnectionError, Handler, Neovim};
+#[cfg(feature = "plugin-http")]
+use nvim_rpc_plugin::{Array, Neovim};
+use nvim_rpc_plugin::{Connection as RpcConnection, ConnectionError, Handler};
 #[cfg(feature = "plugin-http")]
 use nvim_rpc_ui::GridId;
-use nvim_rpc_ui::{
-    Checkpoint, CheckpointError, Client, ClientError, ConnectionOptions, Error as UiError, Frame,
-    FrameError, Frames, Limits, NoHandler, UiHandler,
-};
+use nvim_rpc_ui::{Checkpoint, Client, ClientError, ConnectionOptions, Frames, UiHandler};
 
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Notify;
 
 #[cfg(feature = "plugin-http")]
 use std::collections::BTreeSet;
 #[cfg(feature = "plugin-http")]
-use std::sync::RwLock;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, RwLock};
 
 #[cfg(feature = "plugin-http")]
 pub(crate) type Grids = Arc<RwLock<BTreeSet<GridId>>>;
 
 pub(crate) struct Connection<W> {
     pub client: Client<W>,
-    frames: Option<FrameReceiver>,
+    pub frames: Frames,
     rpc: RpcConnection<W>,
 }
 
 impl<W> Connection<W> {
-    pub(crate) fn initialize_ui(
-        &mut self,
-        setup: UiSetup,
-        checkpoint: Option<Checkpoint>,
-    ) -> Option<CheckpointError> {
-        let (frames, error) = setup.initialize(checkpoint);
-        self.frames = Some(frames);
-        error
-    }
-
-    pub(crate) fn checkpoint_source(&self) -> impl Fn() -> Option<Checkpoint> + Send + 'static {
-        let frames = self
-            .frames
-            .as_ref()
-            .map(|receiver| Arc::clone(&receiver.frames));
-        move || {
-            let frames = frames.as_ref()?;
-            frames
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .checkpoint()
-        }
-    }
-
-    pub(crate) async fn recv_frame(&mut self) -> Option<Result<Frame, FrameError>> {
-        self.frames.as_mut()?.recv().await
-    }
-
     pub(crate) fn stop(&mut self) {
         self.rpc.stop();
     }
@@ -72,102 +41,59 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Connection<W> {
     }
 }
 
-pub(crate) fn begin<R, W, H>(
+pub(crate) fn connect<R, W, H>(
     rdr: R,
     wtr: W,
     handler: H,
     options: ConnectionOptions,
+    checkpoint: Option<Checkpoint>,
     #[cfg(feature = "plugin-http")] grids: Grids,
-) -> Result<(Connection<W>, UiSetup), Error>
+) -> Result<Connection<W>, Error>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
-    H: Handler<W, Notification = Array>,
+    H: Handler<W>,
 {
     use nvim_rpc_plugin::connect as connect_rpc;
+    use nvim_rpc_ui::Error as UiError;
 
-    let ui = Arc::new(ReceivingUi {
-        handler: OnceLock::new(),
-        ready: Arc::new(Notify::new()),
-        limits: options.limits,
-        #[cfg(feature = "plugin-http")]
+    let (handler, frames) = match checkpoint {
+        Some(checkpoint) => UiHandler::from_checkpoint(handler, checkpoint, options.limits)
+            .map_err(|e| Error::Message(format!("Restore UI checkpoint: {e}")))?,
+        None => UiHandler::new(handler, options.limits),
+    };
+    #[cfg(feature = "plugin-http")]
+    if let Some(checkpoint) = frames.checkpoint() {
+        let mut grids = grids.write().unwrap_or_else(|e| e.into_inner());
+        grids.extend(checkpoint.state().grids.keys().copied());
+    }
+    #[cfg(feature = "plugin-http")]
+    let handler = Tracked {
+        inner: handler,
         grids,
-    });
-    let handler = DispatchUi {
-        handler,
-        ui: Arc::clone(&ui),
+        max_grids: options.limits.max_grids,
     };
     let rpc = connect_rpc(rdr, wtr, handler, options.rpc).map_err(UiError::from)?;
     let client = Client::new(rpc.client.clone());
-    Ok((
-        Connection {
-            client,
-            frames: None,
-            rpc,
-        },
-        UiSetup(ui),
-    ))
+    Ok(Connection {
+        client,
+        frames,
+        rpc,
+    })
 }
 
-pub(crate) struct UiSetup(Arc<ReceivingUi>);
-
-impl UiSetup {
-    fn initialize(
-        self,
-        checkpoint: Option<Checkpoint>,
-    ) -> (FrameReceiver, Option<CheckpointError>) {
-        let ui = self.0;
-        let mut error = None;
-        let (handler, frames) = match checkpoint {
-            Some(checkpoint) => {
-                match UiHandler::from_checkpoint(NoHandler, checkpoint, ui.limits) {
-                    Ok(restored) => restored,
-                    Err(e) => {
-                        error = Some(e);
-                        UiHandler::new(NoHandler, ui.limits)
-                    }
-                }
-            }
-            None => UiHandler::new(NoHandler, ui.limits),
-        };
-        #[cfg(feature = "plugin-http")]
-        if let Some(checkpoint) = frames.checkpoint() {
-            let mut grids = ui.grids.write().unwrap_or_else(|e| e.into_inner());
-            grids.extend(checkpoint.state().grids.keys().copied());
-        }
-        let _ = ui.handler.set(handler);
-        let receiver = FrameReceiver {
-            frames: Arc::new(Mutex::new(frames)),
-            ready: Arc::clone(&ui.ready),
-        };
-        (receiver, error)
-    }
-}
-
-struct ReceivingUi {
-    handler: OnceLock<UiHandler<NoHandler>>,
-    ready: Arc<Notify>,
-    limits: Limits,
-    #[cfg(feature = "plugin-http")]
+#[cfg(feature = "plugin-http")]
+struct Tracked<H> {
+    inner: UiHandler<H>,
     grids: Grids,
+    max_grids: usize,
 }
 
-impl Drop for ReceivingUi {
-    fn drop(&mut self) {
-        drop(self.handler.take());
-        self.ready.notify_one();
-    }
-}
-
-struct DispatchUi<H> {
-    handler: H,
-    ui: Arc<ReceivingUi>,
-}
-
-impl<W, H> Handler<W> for DispatchUi<H>
+#[cfg(feature = "plugin-http")]
+impl<W, H> Handler<W> for Tracked<H>
 where
     W: AsyncWrite + Unpin + Send + 'static,
-    H: Handler<W, Notification = Array>,
+    H: Handler<W>,
 {
     type Request = H::Request;
     type Notification = Array;
@@ -179,55 +105,17 @@ where
         params: Self::Request,
         nvim: Neovim<W>,
     ) -> Self::Response {
-        self.handler.on_request(method, params, nvim).await
+        self.inner.on_request(method, params, nvim).await
     }
 
     async fn on_notification(&self, method: &[u8], params: Array, nvim: Neovim<W>) {
-        if !matches!(method, b"redraw" | b"nvim_error_event") {
-            self.handler.on_notification(method, params, nvim).await;
-            return;
-        }
-        let Some(ui) = self.ui.handler.get() else {
-            return;
-        };
-        #[cfg(feature = "plugin-http")]
         if method == b"redraw" {
-            observe(
-                &self.ui.grids,
-                params.with_borrowed_buffer(),
-                self.ui.limits.max_grids,
-            );
+            observe(&self.grids, params.with_borrowed_buffer(), self.max_grids);
         }
-        ui.on_notification(method, params, nvim).await;
-        self.ui.ready.notify_one();
-    }
-}
-
-struct FrameReceiver {
-    frames: Arc<Mutex<Frames>>,
-    ready: Arc<Notify>,
-}
-
-impl FrameReceiver {
-    async fn recv(&mut self) -> Option<Result<Frame, FrameError>> {
-        use std::future::Future as _;
-        use std::pin::pin;
-        use std::task::{Context, Poll, Waker};
-
-        loop {
-            let ready = self.ready.notified();
-            {
-                // Poll once so checkpoint sampling can borrow Frames while the
-                // frontend waits. DispatchUi and ReceivingUi supply the wakeups
-                // for publication, protocol errors, and handler shutdown.
-                let mut frames = self.frames.lock().unwrap_or_else(|e| e.into_inner());
-                let recv = pin!(frames.recv());
-                if let Poll::Ready(result) = recv.poll(&mut Context::from_waker(Waker::noop())) {
-                    return result;
-                }
-            }
-            ready.await;
-        }
+        // UiHandler validates the complete notification and closes malformed
+        // streams before dispatching later plugin calls. Its model and bounded
+        // coalesced frame receiver remain the only owners of rendering state.
+        self.inner.on_notification(method, params, nvim).await;
     }
 }
 
@@ -272,77 +160,14 @@ fn observe(grids: &Grids, params: DecodedArray<&[u8]>, max_grids: usize) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "plugin-http"))]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "plugin-http")]
     use nvim_rpc_plugin::mp::decode::{Object, ObjectParser};
-    #[cfg(feature = "plugin-http")]
     use nvim_rpc_plugin::mp::encode::WriterSyncExt as _;
-    #[cfg(feature = "plugin-http")]
     use nvim_rpc_plugin::{Array, Bytes};
 
-    #[tokio::test]
-    async fn frame_delivery_stops_while_a_client_send_holds_the_writer() {
-        use nvim_rpc_plugin::{Object, api};
-
-        use tokio::io::{AsyncReadExt as _, duplex, split};
-        use tokio::time::{Duration, timeout};
-
-        use std::pin::pin;
-
-        let (stream, mut peer) = duplex(64);
-        let (rdr, wtr) = split(stream);
-        let (mut rpc, ui) = begin(
-            rdr,
-            wtr,
-            NoHandler,
-            ConnectionOptions::default(),
-            #[cfg(feature = "plugin-http")]
-            Grids::default(),
-        )
-        .unwrap();
-        assert!(rpc.initialize_ui(ui, None).is_none());
-
-        {
-            let client = rpc.client.clone();
-            let command = "x".repeat(4096);
-            let mut sending = pin!(
-                client
-                    .nvim()
-                    .request::<api::NvimCommand, Object>((command.as_str(),))
-            );
-            let mut first_byte = [0];
-            // Observe a partial write with plenty of data left to send.
-            tokio::select! {
-                biased;
-                result = &mut sending => panic!("send finished early: {result:?}"),
-                read = timeout(Duration::from_secs(1), peer.read_exact(&mut first_byte)) => {
-                    read.unwrap().unwrap();
-                }
-            }
-
-            rpc.stop();
-            assert!(
-                timeout(Duration::from_secs(1), rpc.recv_frame())
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-            assert!(
-                timeout(Duration::from_millis(20), rpc.wait())
-                    .await
-                    .is_err()
-            );
-        }
-        timeout(Duration::from_secs(1), rpc.wait())
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
-    #[cfg(feature = "plugin-http")]
     fn params(bytes: &[u8]) -> Array {
         let mut parser = ObjectParser::new(Bytes::copy_from_slice(bytes));
         let Object::Array(params) = parser.next_object().unwrap() else {
@@ -351,7 +176,6 @@ mod tests {
         params
     }
 
-    #[cfg(feature = "plugin-http")]
     #[tokio::test]
     async fn tracks_grid_lifetimes_before_the_frontend_receives_frames() {
         use nvim_rpc_plugin::connect as connect_rpc;
@@ -361,17 +185,11 @@ mod tests {
 
         let grids = Grids::default();
         let options = ConnectionOptions::default();
-        let ui = Arc::new(ReceivingUi {
-            handler: OnceLock::new(),
-            ready: Arc::new(Notify::new()),
-            limits: options.limits,
+        let (inner, _unpolled_frames) = UiHandler::new(NoHandler, options.limits);
+        let handler = Tracked {
+            inner,
             grids: grids.clone(),
-        });
-        let (_unpolled_frames, error) = UiSetup(Arc::clone(&ui)).initialize(None);
-        assert!(error.is_none());
-        let handler = DispatchUi {
-            handler: NoHandler,
-            ui,
+            max_grids: options.limits.max_grids,
         };
         let (stream, _peer) = duplex(4096);
         let (rdr, wtr) = split(stream);
@@ -402,9 +220,7 @@ mod tests {
         rpc.close_and_wait().await.unwrap();
     }
 
-    #[cfg(feature = "plugin-http")]
-    #[test]
-    fn restores_plugin_grid_ids_before_the_first_redraw() {
+    fn checkpoint_with_hidden_grid() -> Checkpoint {
         use nvim_rpc_ui::Model;
 
         let mut bytes = Vec::new();
@@ -420,24 +236,63 @@ mod tests {
         model
             .apply_notification(b"redraw", redraw.with_borrowed_buffer(), |_| {})
             .unwrap();
+        model.checkpoint().unwrap()
+    }
+
+    #[tokio::test]
+    async fn restores_plugin_grid_ids_before_the_first_redraw() {
+        use nvim_rpc_ui::NoHandler;
+
+        use tokio::io::{duplex, split};
 
         let grids = Grids::default();
-        let setup = UiSetup(Arc::new(ReceivingUi {
-            handler: OnceLock::new(),
-            ready: Arc::new(Notify::new()),
-            limits: Limits::default(),
-            grids: grids.clone(),
-        }));
-        let (_unpolled_frames, error) = setup.initialize(model.checkpoint());
+        let (stream, _peer) = duplex(4096);
+        let (rdr, wtr) = split(stream);
+        let mut connection = connect(
+            rdr,
+            wtr,
+            NoHandler,
+            ConnectionOptions::default(),
+            Some(checkpoint_with_hidden_grid()),
+            Arc::clone(&grids),
+        )
+        .unwrap();
 
-        assert!(error.is_none());
         assert_eq!(
             grids.read().unwrap().iter().copied().collect::<Vec<_>>(),
             [GridId(1), GridId(2)]
         );
+        connection.stop();
+        connection.wait().await.unwrap();
     }
 
-    #[cfg(feature = "plugin-http")]
+    #[tokio::test]
+    async fn rejects_checkpoints_outside_the_connection_limits() {
+        use nvim_rpc_ui::NoHandler;
+
+        use tokio::io::{duplex, split};
+
+        let mut options = ConnectionOptions::default();
+        options.limits.max_grids = 1;
+        let grids = Grids::default();
+        let (stream, _peer) = duplex(4096);
+        let (rdr, wtr) = split(stream);
+        let result = connect(
+            rdr,
+            wtr,
+            NoHandler,
+            options,
+            Some(checkpoint_with_hidden_grid()),
+            Arc::clone(&grids),
+        );
+
+        assert!(matches!(
+            result,
+            Err(Error::Message(message)) if message.starts_with("Restore UI checkpoint: ")
+        ));
+        assert!(grids.read().unwrap().is_empty());
+    }
+
     #[test]
     fn bounds_observed_grids_before_protocol_validation() {
         let grids = Grids::default();

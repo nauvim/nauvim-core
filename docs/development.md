@@ -29,19 +29,6 @@ forwarding, local copy behavior, HTTP responses, and clipboard backend selection
 without requiring a host Neovim or desktop clipboard. Networking tests need
 permission to bind local loopback ports and Unix sockets.
 
-## UI checkpoint storage
-
-The client database uses SQLite schema version 1. Each host selection has one
-row containing the connected Neovim's process token and up to 64 MiB of opaque
-`nvim-rpc-ui` checkpoint bytes. A mismatch removes the old row. An unsupported
-schema leaves the database intact and disables storage for that attachment.
-
-The UI receiver captures display state at redraw flushes. Core samples the
-latest committed state once per second and saves any remaining change after
-the RPC receiver stops. Each save replaces one row in a single SQLite
-transaction, with a 100 ms wait limit for SQLite locks. A new attachment waits
-for the prior attachment's final save before reading the database.
-
 ## Live integration checks
 
 Live tests are ignored by default. Set `NVIM_BIN` to an absolute executable path

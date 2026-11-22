@@ -3,15 +3,16 @@
 [![crates.io](https://img.shields.io/crates/v/nauvim-core.svg)](https://crates.io/crates/nauvim-core)
 [![docs.rs](https://docs.rs/nauvim-core/badge.svg)](https://docs.rs/nauvim-core)
 
-UI-independent Rust engine for Nauvim, targeting Neovim v0.12.6 on Linux
-x86-64 and aarch64, and macOS Apple Silicon.
+UI-independent Rust implementation of the client engine defined by
+`nauvim-spec`. It targets Neovim v0.12.6 on Linux x86-64 and aarch64, and macOS
+Apple Silicon.
 
 The engine evaluates Lua configuration, starts or reconnects to owned persistent
 Neovim sessions, delivers UI frames, and handles Nauvim plugin RPCs. It includes
 multiplexed SSH connections, local forwarding, host-to-client file copies,
-HTTP(S) file serving, GUI window requests, and clipboard exchange. The application
-provides its renderer and GUI windows; the separate Lua plugin is optional for
-ordinary editor operation.
+HTTP(S) file serving, GUI window requests, and clipboard exchange. Applications
+provide their own renderer and GUI windows. The separate Lua plugin is optional
+for ordinary editor operation.
 
 This implementation targets [`nauvim-spec v1.0.1`](https://github.com/nauvim/nauvim-spec/tree/v1.0.1),
 commit [`624accdb172d93f00c000169ad99a2fce1f68a30`](https://github.com/nauvim/nauvim-spec/commit/624accdb172d93f00c000169ad99a2fce1f68a30).

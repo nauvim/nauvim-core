@@ -6,7 +6,7 @@ mod support;
 use support::checkpoint::{
     assert_no_markers, leave_inactive_tab, next_frame, restored_grids, revisit_inactive_tab,
 };
-use support::{is_clipboard_detection_error, isolated_config};
+use support::is_clipboard_detection_error;
 
 use nvim_rpc_plugin::api;
 
@@ -249,7 +249,11 @@ return {{
             lua_string(self.root.path().join("ssh_config").to_str().unwrap()),
             lua_string(self.root.path().join("known_hosts").to_str().unwrap())
         );
-        isolated_config(self.root.path(), &src, "org.example.nauvim.ssh-test")
+        let file = self.root.path().join("config.lua");
+        fs::write(&file, src).unwrap();
+        let (config, ()) =
+            Config::load(Some(&file), "org.example.nauvim.ssh-test", |_| Ok(())).unwrap();
+        config
     }
 
     async fn stop(mut self) {
@@ -534,6 +538,7 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         #[cfg(feature = "plugin-filesystem")]
         copy(&client, server.root.path(), engine.temp_dir()).await;
         leave_inactive_tab(&client).await;
+        let checkpoint = engine.checkpoint().unwrap();
         engine.detach().await.unwrap();
         engine.shutdown().await.unwrap();
         assert!(server.socket.exists());
@@ -564,7 +569,10 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         fs::write(&known, original).unwrap();
 
         let mut engine = Engine::new(server.config("remote", Some(&server.socket))).unwrap();
-        engine.connect("remote", 60, 16).await.unwrap();
+        engine
+            .connect_with_checkpoint("remote", 60, 16, checkpoint)
+            .await
+            .unwrap();
         let client = engine.client().unwrap();
         assert_eq!(integer(&client, "return vim.fn.getpid()").await, pid);
         wait_setup(&client, engine.client_id()).await;

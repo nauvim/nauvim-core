@@ -3,14 +3,13 @@ use crate::resources::Registry;
 use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
 use crate::resources::clipboard::Clipboard;
-use crate::{ClientId, Config, Error, Policies, Transport};
+use crate::{Checkpoint, ClientId, Config, Error, Policies, Transport};
 
-use super::snapshot::Session;
 use super::{ATTACH_TIMEOUT, Attachment, CHECK_TIMEOUT, EngineEvent};
 
 use tokio::fs;
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -27,7 +26,6 @@ pub(super) struct Attempt {
     pub(super) cleanup_events_tx: mpsc::UnboundedSender<EngineEvent>,
     pub(super) handles: Arc<AtomicI64>,
     pub(super) registry: Arc<Registry>,
-    pub(super) attachment_gate: Arc<Mutex<()>>,
     pub(super) active: Option<Attachment>,
     #[cfg(feature = "plugin-clipboard")]
     pub(super) clipboard: Arc<Clipboard>,
@@ -39,11 +37,12 @@ impl Attempt {
         alias: Option<String>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
         stop: CancellationToken,
     ) -> Result<Attachment, Error> {
         let result = tokio::select! {
             () = stop.cancelled() => Err(Error::Message("Session attachment cancelled".into())),
-            result = timeout(ATTACH_TIMEOUT, self.connect_inner(alias.as_deref(), width, height)) =>
+            result = timeout(ATTACH_TIMEOUT, self.connect_inner(alias.as_deref(), width, height, checkpoint)) =>
                 result.unwrap_or_else(|_| Err(Error::Timeout("Session attachment"))),
         };
         match result {
@@ -65,6 +64,7 @@ impl Attempt {
         alias: Option<&str>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
         use crate::connection;
         #[cfg(feature = "plugin-http")]
@@ -84,7 +84,6 @@ impl Attempt {
         #[cfg(not(feature = "ssh"))]
         let is_remote =
             alias.is_some_and(|alias| self.config.hosts.get(alias).is_none_or(|h| h.remote));
-        let attachment_guard = Arc::clone(&self.attachment_gate).lock_owned().await;
         let (transport, _policies, _remote) = if is_remote {
             #[cfg(feature = "ssh")]
             {
@@ -157,20 +156,29 @@ impl Attempt {
             clipboard_errors: self.errors_tx.clone(),
         };
         let (reader, writer) = split(transport);
-        let options = ConnectionOptions::default();
-        let (rpc, ui) = connection::begin(
+        let rpc = connection::connect(
             reader,
             writer,
             handler,
-            options,
+            ConnectionOptions::default(),
+            checkpoint,
             #[cfg(feature = "plugin-http")]
             grids,
-        )?;
+        );
+        #[cfg(feature = "ssh")]
+        if rpc.is_err()
+            && let Some(remote) = &_remote
+        {
+            use openrussh_client::connect::Disconnect;
+
+            let _ = remote
+                .disconnect(Disconnect::ByApplication, "Attachment failed", "en")
+                .await;
+        }
+        let rpc = rpc?;
         // Store before any awaited registration so timeout/cancellation can close it.
         self.active = Some(Attachment {
             rpc,
-            checkpoint_writer: None,
-            attachment_guard: Some(attachment_guard),
             resources,
             events,
             setup: None,
@@ -181,27 +189,6 @@ impl Attempt {
             #[cfg(feature = "ssh")]
             remote: _remote,
         });
-        let active = self
-            .active
-            .as_mut()
-            .ok_or_else(|| Error::Message("Attachment disappeared".into()))?;
-        let session = Session::open(
-            &self.config,
-            &active.rpc.client,
-            alias,
-            is_remote,
-            options.limits,
-            &self.errors_tx,
-        )
-        .await;
-        let (session, checkpoint) = session.unzip();
-        if let Some(e) = active.rpc.initialize_ui(ui, checkpoint.flatten()) {
-            let _ = self.errors_tx.send(format!("Restore UI checkpoint: {e}"));
-        }
-        if let Some(session) = session {
-            active.checkpoint_writer =
-                Some(session.write(active.rpc.checkpoint_source(), self.errors_tx.clone()));
-        }
         self.register(width, height).await
     }
 

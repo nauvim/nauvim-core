@@ -1,6 +1,6 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-//! UI-independent Nauvim sessions, Lua configuration, and client resources.
+//! UI-independent client engine for the `nauvim-spec` protocol.
 //!
 //! Load [`Config`], construct an [`Engine`], and consume [`EngineEvent`] values
 //! on the application's event loop. Host Neovim processes survive detachment
@@ -40,7 +40,6 @@
 //! # }
 //! ```
 
-mod checkpoint;
 mod config;
 pub use config::{
     ClipboardConfig, Config, HostInfo, HostSelection, Policies, ProjectDirs, UiConfig, UiTable,
@@ -62,7 +61,10 @@ mod socket;
 #[cfg(feature = "ssh")]
 mod ssh;
 
-pub use nvim_rpc_ui::{Backend, Frame, GridId, KeyInput, Modifiers, SpecialKey, State, UiOptions};
+pub use nvim_rpc_ui::{
+    Backend, Checkpoint, CheckpointError, Frame, GridId, KeyInput, Modifiers, SpecialKey, State,
+    UiOptions,
+};
 
 use std::fmt;
 
@@ -70,7 +72,7 @@ fn is_spec_string(s: &str) -> bool {
     !s.starts_with('\u{feff}') && !s.contains('\0')
 }
 
-/// Identifies one Nauvim process across attachments.
+/// Identifies one client process across attachments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ClientId(u32);
 

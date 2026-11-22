@@ -6,11 +6,10 @@ use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
 use crate::resources::clipboard::Clipboard;
 use crate::resources::{Registry, Resources};
-use crate::{ClientId, Config, Error, Frame, GridId, ResourceHandle, Transport};
+use crate::{Checkpoint, ClientId, Config, Error, Frame, GridId, ResourceHandle, Transport};
 
 mod attempt;
 use attempt::Attempt;
-mod snapshot;
 
 use nvim_rpc_ui::Client as UiClient;
 
@@ -19,7 +18,6 @@ use tokio::io::WriteHalf;
 use tokio::runtime::Handle;
 use tokio::signal::unix::Signal;
 use tokio::sync::mpsc;
-use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio::time::{Duration, timeout};
 use tokio_util::sync::CancellationToken;
@@ -97,8 +95,6 @@ pub enum EngineEvent {
 
 struct Attachment {
     rpc: Connection<WriteHalf<Transport>>,
-    checkpoint_writer: Option<snapshot::Writer>,
-    attachment_guard: Option<OwnedMutexGuard<()>>,
     resources: Arc<Resources>,
     events: mpsc::UnboundedReceiver<EngineEvent>,
     setup: Option<JoinHandle<()>>,
@@ -129,15 +125,6 @@ impl Attachment {
             let _ = timeout(Duration::from_secs(2), self.rpc.detach_ui()).await;
         }
         self.rpc.stop();
-        if let Some(mut writer) = self.checkpoint_writer.take() {
-            // A terminal frame stream has committed its last checkpoint.
-            // Waiting for it does not depend on callers releasing send futures.
-            while self.rpc.recv_frame().await.is_some() {}
-            writer.finish().await;
-        }
-        // A reconnect can now restore the final committed state. The remaining
-        // cleanup still owns the previous attachment's resources and SSH link.
-        drop(self.attachment_guard.take());
         self.resources.cleanup().await;
         #[cfg(feature = "plugin-clipboard")]
         if let Err(e) = self.clipboard.shutdown().await {
@@ -175,7 +162,6 @@ pub struct Engine {
     active: Option<Attachment>,
     connecting: Option<Connecting>,
     cleanup: JoinSet<()>,
-    attachment_gate: Arc<Mutex<()>>,
     queued: VecDeque<EngineEvent>,
     pending_errors: VecDeque<String>,
     errors_tx: mpsc::UnboundedSender<String>,
@@ -223,7 +209,6 @@ impl Engine {
             active: None,
             connecting: None,
             cleanup: JoinSet::new(),
-            attachment_gate: Arc::default(),
             queued: Default::default(),
             pending_errors,
             errors_tx,
@@ -255,6 +240,15 @@ impl Engine {
     /// Clones the current input client, if attached.
     pub fn client(&self) -> Option<Client> {
         self.active.as_ref().map(|a| a.rpc.client.clone())
+    }
+
+    /// Returns the active attachment's latest committed display checkpoint.
+    ///
+    /// The receiver updates the checkpoint at redraw flushes, independently of
+    /// [`Self::next_event()`]. Returns `None` when there is no active attachment
+    /// or a fresh attachment has not received its first flush.
+    pub fn checkpoint(&self) -> Option<Checkpoint> {
+        self.active.as_ref()?.rpc.frames.checkpoint()
     }
 
     /// Pastes the client system clipboard into the currently attached Neovim.
@@ -312,6 +306,29 @@ impl Engine {
     /// Later calls have no effect. Detachment and recovery never repeat the
     /// automatic startup connection.
     pub async fn start(&mut self, width: u32, height: u32) -> Result<(), Error> {
+        self.start_selection(width, height, None).await
+    }
+
+    /// Applies startup host selection with a caller-supplied checkpoint.
+    ///
+    /// Uses the selection rules of [`Self::start()`]. Supply a checkpoint for
+    /// the same running Neovim process that the configuration selects. If there
+    /// is no startup selection, opens the welcome page.
+    pub async fn start_with_checkpoint(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.start_selection(width, height, Some(checkpoint)).await
+    }
+
+    async fn start_selection(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Option<Checkpoint>,
+    ) -> Result<(), Error> {
         use crate::HostSelection;
 
         if self.closed {
@@ -323,10 +340,14 @@ impl Engine {
         self.install_signal()?;
         self.started = true;
         match self.config.startup_host() {
-            Some(HostSelection::Default) => self.connect_default(width, height).await,
+            Some(HostSelection::Default) => {
+                self.connect_selection(None, width, height, checkpoint)
+                    .await
+            }
             Some(HostSelection::Alias(alias)) => {
                 let alias = alias.to_owned();
-                self.connect(&alias, width, height).await
+                self.connect_selection(Some(&alias), width, height, checkpoint)
+                    .await
             }
             None => {
                 self.install_signal()?;
@@ -341,12 +362,43 @@ impl Engine {
     /// On failure there is no active attachment and a welcome event carries the
     /// error. Function-valued paths receive host-role information.
     pub async fn connect(&mut self, alias: &str, width: u32, height: u32) -> Result<(), Error> {
-        self.connect_selection(Some(alias), width, height).await
+        self.connect_selection(Some(alias), width, height, None)
+            .await
+    }
+
+    /// Attaches to a host alias with a caller-supplied display checkpoint.
+    ///
+    /// Supply a checkpoint for the same running Neovim process. The receiving
+    /// UI model applies it before attachment and the first frame requests a
+    /// full repaint. Attachment failures follow [`Self::connect()`].
+    pub async fn connect_with_checkpoint(
+        &mut self,
+        alias: &str,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.connect_selection(Some(alias), width, height, Some(checkpoint))
+            .await
     }
 
     /// Starts or reuses the independent default local host.
     pub async fn connect_default(&mut self, width: u32, height: u32) -> Result<(), Error> {
-        self.connect_selection(None, width, height).await
+        self.connect_selection(None, width, height, None).await
+    }
+
+    /// Attaches to the default local host with a caller-supplied checkpoint.
+    ///
+    /// Uses the same checkpoint and frame contract as
+    /// [`Self::connect_with_checkpoint()`].
+    pub async fn connect_default_with_checkpoint(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.connect_selection(None, width, height, Some(checkpoint))
+            .await
     }
 
     async fn connect_selection(
@@ -354,8 +406,9 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
-        self.begin_connection(alias, width, height)?;
+        self.begin_connection(alias, width, height, checkpoint)?;
         self.wait_connection().await
     }
 
@@ -368,7 +421,6 @@ impl Engine {
             cleanup_events_tx: self.cleanup_events_tx.clone(),
             handles: Arc::clone(&self.handles),
             registry: Arc::clone(&self.registry),
-            attachment_gate: Arc::clone(&self.attachment_gate),
             active: None,
             #[cfg(feature = "plugin-clipboard")]
             clipboard: Arc::new(self.clipboard.fork()),
@@ -380,6 +432,7 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
+        checkpoint: Option<Checkpoint>,
     ) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Message("Engine has shut down".into()));
@@ -412,7 +465,7 @@ impl Engine {
             .runtime
             .as_ref()
             .ok_or_else(|| Error::Message("Connection runtime is unavailable".into()))?;
-        let task = runtime.spawn(attempt.run(alias, width, height, task_stop));
+        let task = runtime.spawn(attempt.run(alias, width, height, checkpoint, task_stop));
         self.connecting = Some(Connecting { stop, task });
         Ok(())
     }
@@ -520,7 +573,7 @@ impl Engine {
         }
         if let Some(host) = self.pending_host.take() {
             let (width, height) = self.dimensions;
-            let _ = self.begin_connection(Some(&host), width, height);
+            let _ = self.begin_connection(Some(&host), width, height, None);
             if let Some(event) = self.queued.pop_front() {
                 return event;
             }
@@ -565,7 +618,7 @@ impl Engine {
                         None => continue,
                     }
                 }
-                frame = active.rpc.recv_frame() => {
+                frame = active.rpc.frames.recv() => {
                     match frame {
                         Some(Ok(frame)) => {
                             EngineEvent::Frame(frame)
@@ -850,16 +903,16 @@ mod tests {
         engine.install_signal().unwrap();
         let (local, _peer) = UnixStream::pair().unwrap();
         let (rdr, wtr) = split(Transport::local(local));
-        let (mut rpc, ui) = connection::begin(
+        let rpc = connection::connect(
             rdr,
             wtr,
             NoHandler,
             ConnectionOptions::default(),
+            None,
             #[cfg(feature = "plugin-http")]
             Grids::default(),
         )
         .unwrap();
-        assert!(rpc.initialize_ui(ui, None).is_none());
         let (events_tx, events) = mpsc::unbounded_channel();
         events_tx
             .send(EngineEvent::Connect {
@@ -868,8 +921,6 @@ mod tests {
             .unwrap_or_else(|_| panic!("Attachment event receiver disappeared"));
         engine.active = Some(Attachment {
             rpc,
-            checkpoint_writer: None,
-            attachment_guard: None,
             resources: Arc::new(Resources::new(
                 engine.temp_path.clone(),
                 engine.errors_tx.clone(),
@@ -984,21 +1035,19 @@ mod tests {
             let mut host =
                 connect_rpc(rdr, wtr, Host(Arc::clone(&calls)), RpcOptions::default()).unwrap();
             let (rdr, wtr) = split(Transport::local(local));
-            let (mut rpc, ui) = connection::begin(
+            let rpc = connection::connect(
                 rdr,
                 wtr,
                 NoHandler,
                 ConnectionOptions::default(),
+                None,
                 #[cfg(feature = "plugin-http")]
                 Grids::default(),
             )
             .unwrap();
-            assert!(rpc.initialize_ui(ui, None).is_none());
             let (_, events) = mpsc::unbounded_channel();
             engine.active = Some(Attachment {
                 rpc,
-                checkpoint_writer: None,
-                attachment_guard: None,
                 resources: Arc::new(Resources::new(
                     engine.temp_path.clone(),
                     engine.errors_tx.clone(),
