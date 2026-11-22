@@ -197,17 +197,17 @@ a five-second timeout and attachment has a twenty-second timeout.
 
 ### Reattaching to a session
 
-Nauvim keeps a display checkpoint on the client so that a surviving Neovim can
-update grids for inactive tabs after reattachment. This applies to local and
-SSH hosts. If the host Neovim has restarted, Nauvim starts with a fresh display
-model.
+`nauvim-core` restores the last display checkpoint when it reattaches to the
+same local or SSH Neovim process. The checkpoint retains grids for inactive tabs
+and lets any frontend render the first frame through the usual `Engine` API.
+A replacement Neovim process starts with a fresh display model.
 
-Nauvim stores the checkpoints in `ui-checkpoints.sqlite3` in the client data
-directory. On Linux, this is `$XDG_DATA_HOME/nauvim` or
-`$HOME/.local/share/nauvim` when `XDG_DATA_HOME` is unset. The database can
-contain text displayed in the editor. Detachment and client exit preserve it
-for later sessions. If the saved checkpoint cannot be read, Nauvim reports the
-error and attempts attachment with an empty display model.
+The engine stores `ui-checkpoints.sqlite3` under the client
+`HostInfo.project_dirs.data_dir`. The database can contain text displayed in the
+editor. Detachment and client exit preserve it for later attachments. If a saved
+checkpoint cannot be read, the engine reports the error and attempts attachment
+with an empty display model. See the
+[project-directory defaults in nauvim-spec](https://github.com/nauvim/nauvim-spec/blob/v1.0.1/specification.md#values-defaults-and-path-properties).
 
 ## SSH configuration
 

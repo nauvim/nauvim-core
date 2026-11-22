@@ -31,8 +31,8 @@ impl Session {
         errors: &mpsc::UnboundedSender<String>,
     ) -> Option<(Self, Option<Checkpoint>)> {
         let kind = if remote { "ssh" } else { "local" };
-        let token = match timeout(IDENTITY_TIMEOUT, session_token(client, kind)).await {
-            Ok(Ok(token)) => token?,
+        let token = match timeout(IDENTITY_TIMEOUT, session_token(client)).await {
+            Ok(Ok(token)) => token,
             Ok(Err(e)) => {
                 let _ = errors.send(format!("Identify Neovim for UI checkpoint: {e}"));
                 return None;
@@ -157,14 +157,13 @@ impl Drop for Writer {
     }
 }
 
-async fn session_token(client: &Client, kind: &str) -> Result<Option<String>, Error> {
+async fn session_token(client: &Client) -> Result<String, Error> {
     use getrandom::fill;
 
-    // This also identifies surviving hosts started before checkpoint support.
-    // Lua globals stay in this Neovim process and are outside ShaDa.
+    // The caller has already selected the owned socket. Match the process on
+    // that connection, including hosts started before checkpoint support.
     const SCRIPT: &str = r#"
-        local kind, candidate = ...
-        if vim.env.NAUVIM_CONNECTION ~= kind then return '' end
+        local candidate = ...
         local key = 'nauvim_core_session_id'
         local token = rawget(_G, key)
         if token == nil then
@@ -179,13 +178,10 @@ async fn session_token(client: &Client, kind: &str) -> Result<Option<String>, Er
     let candidate = format!("{:032x}", u128::from_ne_bytes(bytes));
     let token = client
         .nvim()
-        .request::<api::NvimExecLua, String>((SCRIPT, (kind, candidate.as_str())))
+        .request::<api::NvimExecLua, String>((SCRIPT, (candidate.as_str(),)))
         .await?;
-    if token.is_empty() {
-        return Ok(None);
-    }
     if token.len() != 32 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::Message("Invalid Neovim session ID".into()));
     }
-    Ok(Some(token))
+    Ok(token)
 }

@@ -35,7 +35,7 @@ pub async fn leave_inactive_tab(client: &Client) {
             local channel = vim.api.nvim_list_uis()[1].chan
             vim.rpcnotify(channel, 'redraw', {'bell', {}}, {'flush', {}})
             -- Core answers this unaddressed request after preceding redraws.
-            vim.rpcrequest(channel, 'nauvim-plugin/test.barrier', vim.NIL)
+            vim.rpcrequest(channel, 'test.redraw_barrier', vim.NIL)
             return true
             "#,
             (),

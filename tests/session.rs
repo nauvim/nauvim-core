@@ -28,13 +28,20 @@ fn lua_string(s: &str) -> String {
 }
 
 fn config(root: &Path, socket: &Path) -> Config {
-    let bin = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
     // Exercise core registration without requiring the separate Lua component.
     let startup = r#"lua package.preload['nauvim-plugin.client']=function() return {
         setup=function(opts) _G.nauvim_test_setup_id=opts.client_id end
     } end"#;
+    session_config(root, socket, Some(startup))
+}
+
+fn session_config(root: &Path, socket: &Path, startup: Option<&str>) -> Config {
+    let bin = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
+    let extra_args = startup
+        .map(|script| format!(", \"--cmd\", {}", lua_string(script)))
+        .unwrap_or_default();
     let src = format!(
-        r#"local program = {{prog = {}, args = {{"-u", "NONE", "-i", "NONE", "-n", "--cmd", {}}}, env = {{}}}}
+        r#"local program = {{prog = {}, args = {{"-u", "NONE", "-i", "NONE", "-n"{extra_args}}}}}
         return {{hosts = {{
             local_host = {{
                 nvim = program,
@@ -43,7 +50,6 @@ fn config(root: &Path, socket: &Path) -> Config {
             next_host = {{nvim = program, socket = {}}},
         }}}}"#,
         lua_string(&bin),
-        lua_string(startup),
         lua_string(socket.to_str().unwrap()),
         lua_string(socket.with_extension("next.sock").to_str().unwrap())
     );
@@ -377,9 +383,12 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
 async fn live_restores_checkpoints_when_reattaching_and_switching_owned_hosts() {
     let root = tempdir().unwrap();
     let socket = root.path().join("checkpoint.sock");
-    let mut engine = Engine::new(config(root.path(), &socket)).unwrap();
+    let startup =
+        "lua assert(vim.env.NAUVIM_CONNECTION == 'local'); vim.env.NAUVIM_CONNECTION = nil";
+    let mut engine = Engine::new(session_config(root.path(), &socket, Some(startup))).unwrap();
     engine.connect("local_host", 80, 24).await.unwrap();
     let client = engine.client().unwrap();
+    assert!(lua_bool(&client, "return vim.env.NAUVIM_CONNECTION == nil").await);
     let host_pid = pid(&client).await;
     leave_inactive_tab(&client).await;
 
@@ -463,7 +472,7 @@ async fn live_restores_an_inactive_tab_in_a_new_client_process() {
     if let Some(root) = env::var_os(ROOT) {
         let root = Path::new(&root);
         let socket = root.join("checkpoint.sock");
-        let mut engine = Engine::new(config(root, &socket)).unwrap();
+        let mut engine = Engine::new(session_config(root, &socket, None)).unwrap();
         engine.connect("local_host", 80, 24).await.unwrap();
         let client = engine.client().unwrap();
         let host_pid = pid(&client).await;
@@ -535,7 +544,7 @@ async fn live_reports_a_corrupt_checkpoint_database_and_still_attaches() {
     fs::write(&database, corrupt).unwrap();
 
     let socket = root.path().join("checkpoint.sock");
-    let mut engine = Engine::new(config(root.path(), &socket)).unwrap();
+    let mut engine = Engine::new(session_config(root.path(), &socket, None)).unwrap();
     engine.connect("local_host", 80, 24).await.unwrap();
     timeout(Duration::from_secs(5), async {
         let mut rendered = false;
