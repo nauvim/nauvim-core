@@ -19,7 +19,7 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "plugin-http")]
 pub(crate) type Grids = Arc<RwLock<BTreeSet<GridId>>>;
 
-pub(crate) enum CheckpointUse {
+pub(crate) enum CheckpointRole {
     Restore(Checkpoint),
     Reference(Checkpoint),
 }
@@ -51,7 +51,7 @@ pub(crate) fn connect<R, W, H>(
     wtr: W,
     handler: H,
     options: ConnectionOptions,
-    checkpoint: Option<CheckpointUse>,
+    checkpoint: Option<CheckpointRole>,
     #[cfg(feature = "plugin-http")] grids: Grids,
 ) -> Result<Connection<W>, Error>
 where
@@ -63,13 +63,13 @@ where
     use nvim_rpc_ui::Error as UiError;
 
     #[cfg(feature = "plugin-http")]
-    let reference = matches!(checkpoint, Some(CheckpointUse::Reference(_)));
+    let reference = matches!(checkpoint, Some(CheckpointRole::Reference(_)));
     let (handler, frames) = match checkpoint {
-        Some(CheckpointUse::Restore(checkpoint)) => {
+        Some(CheckpointRole::Restore(checkpoint)) => {
             UiHandler::from_checkpoint(handler, checkpoint, options.limits)
                 .map_err(|e| Error::Message(format!("Restore UI checkpoint: {e}")))?
         }
-        Some(CheckpointUse::Reference(checkpoint)) => {
+        Some(CheckpointRole::Reference(checkpoint)) => {
             UiHandler::with_checkpoint_reference(handler, checkpoint, options.limits)
                 .map_err(|e| Error::Message(format!("Use UI checkpoint as a reference: {e}")))?
         }
@@ -347,7 +347,7 @@ mod tests {
             wtr,
             NoHandler,
             ConnectionOptions::default(),
-            Some(CheckpointUse::Restore(checkpoint_with_hidden_grid())),
+            Some(CheckpointRole::Restore(checkpoint_with_hidden_grid())),
             Arc::clone(&grids),
         )
         .unwrap();
@@ -376,7 +376,7 @@ mod tests {
             wtr,
             NoHandler,
             options,
-            Some(CheckpointUse::Restore(checkpoint_with_hidden_grid())),
+            Some(CheckpointRole::Restore(checkpoint_with_hidden_grid())),
             Arc::clone(&grids),
         );
 

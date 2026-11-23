@@ -1,6 +1,6 @@
 #[cfg(feature = "plugin-http")]
 use crate::WebviewWindow;
-use crate::connection::{CheckpointUse, Connection};
+use crate::connection::{CheckpointRole, Connection};
 #[cfg(feature = "ssh")]
 use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
@@ -324,7 +324,7 @@ impl Engine {
         height: u32,
         checkpoint: Checkpoint,
     ) -> Result<(), Error> {
-        self.start_selection(width, height, Some(CheckpointUse::Restore(checkpoint)))
+        self.start_selection(width, height, Some(CheckpointRole::Restore(checkpoint)))
             .await
     }
 
@@ -339,7 +339,7 @@ impl Engine {
         height: u32,
         checkpoint: Checkpoint,
     ) -> Result<(), Error> {
-        self.start_selection(width, height, Some(CheckpointUse::Reference(checkpoint)))
+        self.start_selection(width, height, Some(CheckpointRole::Reference(checkpoint)))
             .await
     }
 
@@ -347,7 +347,7 @@ impl Engine {
         &mut self,
         width: u32,
         height: u32,
-        checkpoint: Option<CheckpointUse>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         use crate::HostSelection;
 
@@ -403,7 +403,7 @@ impl Engine {
             Some(alias),
             width,
             height,
-            Some(CheckpointUse::Restore(checkpoint)),
+            Some(CheckpointRole::Restore(checkpoint)),
         )
         .await
     }
@@ -425,7 +425,7 @@ impl Engine {
             Some(alias),
             width,
             height,
-            Some(CheckpointUse::Reference(checkpoint)),
+            Some(CheckpointRole::Reference(checkpoint)),
         )
         .await
     }
@@ -449,7 +449,7 @@ impl Engine {
             None,
             width,
             height,
-            Some(CheckpointUse::Restore(checkpoint)),
+            Some(CheckpointRole::Restore(checkpoint)),
         )
         .await
     }
@@ -468,7 +468,7 @@ impl Engine {
             None,
             width,
             height,
-            Some(CheckpointUse::Reference(checkpoint)),
+            Some(CheckpointRole::Reference(checkpoint)),
         )
         .await
     }
@@ -478,7 +478,7 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
-        checkpoint: Option<CheckpointUse>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         self.begin_connection(alias, width, height, checkpoint)?;
         self.wait_connection().await
@@ -504,7 +504,7 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
-        checkpoint: Option<CheckpointUse>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Message("Engine has shut down".into()));

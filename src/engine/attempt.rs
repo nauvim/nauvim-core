@@ -1,4 +1,4 @@
-use crate::connection::CheckpointUse;
+use crate::connection::CheckpointRole;
 use crate::resources::Registry;
 #[cfg(feature = "ssh")]
 use crate::resources::Remote;
@@ -38,7 +38,7 @@ impl Attempt {
         alias: Option<String>,
         width: u32,
         height: u32,
-        checkpoint: Option<CheckpointUse>,
+        checkpoint: Option<CheckpointRole>,
         stop: CancellationToken,
     ) -> Result<Attachment, Error> {
         let result = tokio::select! {
@@ -65,7 +65,7 @@ impl Attempt {
         alias: Option<&str>,
         width: u32,
         height: u32,
-        checkpoint: Option<CheckpointUse>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         use crate::connection;
         #[cfg(feature = "plugin-http")]
