@@ -1,6 +1,6 @@
 #[cfg(feature = "plugin-http")]
 use crate::WebviewWindow;
-use crate::connection::Connection;
+use crate::connection::{CheckpointRole, Connection};
 #[cfg(feature = "ssh")]
 use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
@@ -246,7 +246,9 @@ impl Engine {
     ///
     /// The receiver updates the checkpoint at redraw flushes, independently of
     /// [`Self::next_event()`]. Returns `None` when there is no active attachment
-    /// or a fresh attachment has not received its first flush.
+    /// or a fresh or reference-mode attachment is still awaiting its first flush.
+    /// A reference-mode checkpoint can also include saved grids that no redraw
+    /// event has used yet. [`EngineEvent::Frame`] carries the current display.
     pub fn checkpoint(&self) -> Option<Checkpoint> {
         self.active.as_ref()?.rpc.frames.checkpoint()
     }
@@ -322,14 +324,30 @@ impl Engine {
         height: u32,
         checkpoint: Checkpoint,
     ) -> Result<(), Error> {
-        self.start_selection(width, height, Some(checkpoint)).await
+        self.start_selection(width, height, Some(CheckpointRole::Restore(checkpoint)))
+            .await
+    }
+
+    /// Applies startup host selection with a caller-supplied checkpoint reference.
+    ///
+    /// Uses the selection rules of [`Self::start()`] and the reference contract of
+    /// [`Self::connect_with_checkpoint_reference()`]. If there is no startup
+    /// selection, opens the welcome page.
+    pub async fn start_with_checkpoint_reference(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.start_selection(width, height, Some(CheckpointRole::Reference(checkpoint)))
+            .await
     }
 
     async fn start_selection(
         &mut self,
         width: u32,
         height: u32,
-        checkpoint: Option<Checkpoint>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         use crate::HostSelection;
 
@@ -381,8 +399,35 @@ impl Engine {
         height: u32,
         checkpoint: Checkpoint,
     ) -> Result<(), Error> {
-        self.connect_selection(Some(alias), width, height, Some(checkpoint))
-            .await
+        self.connect_selection(
+            Some(alias),
+            width,
+            height,
+            Some(CheckpointRole::Restore(checkpoint)),
+        )
+        .await
+    }
+
+    /// Reattaches to a host alias using a checkpoint as a reference.
+    ///
+    /// Supply a checkpoint for the same running Neovim process. The receiving
+    /// UI model starts empty and uses the checkpoint to resolve missing data
+    /// needed by redraw events. The first redraw flush requests a full repaint.
+    /// Session and connection failures follow [`Self::connect_with_checkpoint()`].
+    pub async fn connect_with_checkpoint_reference(
+        &mut self,
+        alias: &str,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.connect_selection(
+            Some(alias),
+            width,
+            height,
+            Some(CheckpointRole::Reference(checkpoint)),
+        )
+        .await
     }
 
     /// Starts or reuses the independent default local host.
@@ -400,8 +445,32 @@ impl Engine {
         height: u32,
         checkpoint: Checkpoint,
     ) -> Result<(), Error> {
-        self.connect_selection(None, width, height, Some(checkpoint))
-            .await
+        self.connect_selection(
+            None,
+            width,
+            height,
+            Some(CheckpointRole::Restore(checkpoint)),
+        )
+        .await
+    }
+
+    /// Reattaches to the default local host using a checkpoint as a reference.
+    ///
+    /// Uses the same checkpoint and frame contract as
+    /// [`Self::connect_with_checkpoint_reference()`].
+    pub async fn connect_default_with_checkpoint_reference(
+        &mut self,
+        width: u32,
+        height: u32,
+        checkpoint: Checkpoint,
+    ) -> Result<(), Error> {
+        self.connect_selection(
+            None,
+            width,
+            height,
+            Some(CheckpointRole::Reference(checkpoint)),
+        )
+        .await
     }
 
     async fn connect_selection(
@@ -409,7 +478,7 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
-        checkpoint: Option<Checkpoint>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         self.begin_connection(alias, width, height, checkpoint)?;
         self.wait_connection().await
@@ -435,7 +504,7 @@ impl Engine {
         alias: Option<&str>,
         width: u32,
         height: u32,
-        checkpoint: Option<Checkpoint>,
+        checkpoint: Option<CheckpointRole>,
     ) -> Result<(), Error> {
         if self.closed {
             return Err(Error::Message("Engine has shut down".into()));

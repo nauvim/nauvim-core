@@ -19,6 +19,11 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "plugin-http")]
 pub(crate) type Grids = Arc<RwLock<BTreeSet<GridId>>>;
 
+pub(crate) enum CheckpointRole {
+    Restore(Checkpoint),
+    Reference(Checkpoint),
+}
+
 pub(crate) struct Connection<W> {
     pub client: Client<W>,
     pub frames: Frames,
@@ -46,7 +51,7 @@ pub(crate) fn connect<R, W, H>(
     wtr: W,
     handler: H,
     options: ConnectionOptions,
-    checkpoint: Option<Checkpoint>,
+    checkpoint: Option<CheckpointRole>,
     #[cfg(feature = "plugin-http")] grids: Grids,
 ) -> Result<Connection<W>, Error>
 where
@@ -57,13 +62,21 @@ where
     use nvim_rpc_plugin::connect as connect_rpc;
     use nvim_rpc_ui::Error as UiError;
 
+    #[cfg(feature = "plugin-http")]
+    let reference = matches!(checkpoint, Some(CheckpointRole::Reference(_)));
     let (handler, frames) = match checkpoint {
-        Some(checkpoint) => UiHandler::from_checkpoint(handler, checkpoint, options.limits)
-            .map_err(|e| Error::Message(format!("Restore UI checkpoint: {e}")))?,
+        Some(CheckpointRole::Restore(checkpoint)) => {
+            UiHandler::from_checkpoint(handler, checkpoint, options.limits)
+                .map_err(|e| Error::Message(format!("Restore UI checkpoint: {e}")))?
+        }
+        Some(CheckpointRole::Reference(checkpoint)) => {
+            UiHandler::with_checkpoint_reference(handler, checkpoint, options.limits)
+                .map_err(|e| Error::Message(format!("Use UI checkpoint as a reference: {e}")))?
+        }
         None => UiHandler::new(handler, options.limits),
     };
     #[cfg(feature = "plugin-http")]
-    if let Some(checkpoint) = frames.checkpoint() {
+    if !reference && let Some(checkpoint) = frames.checkpoint() {
         let mut grids = grids.write().unwrap_or_else(|e| e.into_inner());
         grids.extend(checkpoint.state().grids.keys().copied());
     }
@@ -72,6 +85,7 @@ where
         inner: handler,
         grids,
         max_grids: options.limits.max_grids,
+        reference,
     };
     let rpc = connect_rpc(rdr, wtr, handler, options.rpc).map_err(UiError::from)?;
     let client = Client::new(rpc.client.clone());
@@ -87,6 +101,7 @@ struct Tracked<H> {
     inner: UiHandler<H>,
     grids: Grids,
     max_grids: usize,
+    reference: bool,
 }
 
 #[cfg(feature = "plugin-http")]
@@ -105,11 +120,20 @@ where
         params: Self::Request,
         nvim: Neovim<W>,
     ) -> Self::Response {
+        // Reference-mode grids can first materialize while applying a line,
+        // cursor, or placement update. Read membership from the actual model
+        // when a preview needs it.
+        if self.reference && method == b"nauvim-plugin/http.open_webview" {
+            let live = self.inner.grids();
+            let mut grids = self.grids.write().unwrap_or_else(|e| e.into_inner());
+            grids.retain(|id| live.contains_key(id));
+            grids.extend(live.keys().copied());
+        }
         self.inner.on_request(method, params, nvim).await
     }
 
     async fn on_notification(&self, method: &[u8], params: Array, nvim: Neovim<W>) {
-        if method == b"redraw" {
+        if !self.reference && method == b"redraw" {
             observe(&self.grids, params.with_borrowed_buffer(), self.max_grids);
         }
         // UiHandler validates the complete notification and closes malformed
@@ -190,6 +214,7 @@ mod tests {
             inner,
             grids: grids.clone(),
             max_grids: options.limits.max_grids,
+            reference: false,
         };
         let (stream, _peer) = duplex(4096);
         let (rdr, wtr) = split(stream);
@@ -217,6 +242,75 @@ mod tests {
             grids.read().unwrap().iter().copied().collect::<Vec<_>>(),
             [GridId(1)]
         );
+        rpc.close_and_wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reference_preview_requests_see_only_live_grids() {
+        use nvim_rpc_plugin::connect as connect_rpc;
+        use nvim_rpc_ui::NoHandler;
+
+        use tokio::io::{duplex, split};
+
+        let grids = Grids::default();
+        let options = ConnectionOptions::default();
+        let (inner, _unpolled_frames) = UiHandler::with_checkpoint_reference(
+            NoHandler,
+            checkpoint_with_hidden_grid(),
+            options.limits,
+        )
+        .unwrap();
+        let handler = Tracked {
+            inner,
+            grids: grids.clone(),
+            max_grids: options.limits.max_grids,
+            reference: true,
+        };
+        let (stream, _peer) = duplex(4096);
+        let (rdr, wtr) = split(stream);
+        let mut rpc = connect_rpc(rdr, wtr, NoHandler, options.rpc).unwrap();
+
+        let request = b"nauvim-plugin/http.open_webview";
+        // The inner handler rejects the request after the wrapper checks membership.
+        let expected = Err("RPC client does not implement this method");
+        assert_eq!(
+            handler
+                .on_request(request, params(&[0x90]), rpc.client.clone())
+                .await,
+            expected
+        );
+        assert!(grids.read().unwrap().is_empty());
+
+        let mut bytes = Vec::new();
+        bytes
+            .write_primitive((("grid_cursor_goto", (2, 0, 0)),))
+            .consume();
+        handler
+            .on_notification(b"redraw", params(&bytes), rpc.client.clone())
+            .await;
+        assert_eq!(
+            handler
+                .on_request(request, params(&[0x90]), rpc.client.clone())
+                .await,
+            expected
+        );
+        assert_eq!(
+            grids.read().unwrap().iter().copied().collect::<Vec<_>>(),
+            [GridId(2)]
+        );
+
+        bytes.clear();
+        bytes.write_primitive((("grid_destroy", (2,)),)).consume();
+        handler
+            .on_notification(b"redraw", params(&bytes), rpc.client.clone())
+            .await;
+        assert_eq!(
+            handler
+                .on_request(request, params(&[0x90]), rpc.client.clone())
+                .await,
+            expected
+        );
+        assert!(grids.read().unwrap().is_empty());
         rpc.close_and_wait().await.unwrap();
     }
 
@@ -253,7 +347,7 @@ mod tests {
             wtr,
             NoHandler,
             ConnectionOptions::default(),
-            Some(checkpoint_with_hidden_grid()),
+            Some(CheckpointRole::Restore(checkpoint_with_hidden_grid())),
             Arc::clone(&grids),
         )
         .unwrap();
@@ -282,7 +376,7 @@ mod tests {
             wtr,
             NoHandler,
             options,
-            Some(checkpoint_with_hidden_grid()),
+            Some(CheckpointRole::Restore(checkpoint_with_hidden_grid())),
             Arc::clone(&grids),
         );
 
