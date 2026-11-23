@@ -397,6 +397,35 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
 
 #[tokio::test]
 #[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_reattaches_using_a_checkpoint_reference() {
+    let root = tempdir().unwrap();
+    let socket = root.path().join("checkpoint-reference.sock");
+    let mut engine = Engine::new(session_config(root.path(), &socket, None)).unwrap();
+    engine.connect("local_host", 80, 24).await.unwrap();
+
+    let client = engine.client().unwrap();
+    let host_pid = pid(&client).await;
+    leave_inactive_tab(&client).await;
+    let checkpoint = engine.checkpoint().unwrap();
+    let grids = hidden_grids(checkpoint.state()).unwrap();
+    engine.detach().await.unwrap();
+
+    engine
+        .connect_with_checkpoint_reference("local_host", 80, 24, checkpoint)
+        .await
+        .unwrap();
+    let client = engine.client().unwrap();
+    assert_eq!(pid(&client).await, host_pid);
+    let first = next_frame(&mut engine).await;
+    assert!(first.damage.full);
+    assert_no_markers(&first);
+
+    revisit_inactive_tab(&mut engine, &client, &grids).await;
+    quit(&mut engine).await;
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
 async fn live_restores_checkpoints_when_reattaching_and_switching_owned_hosts() {
     let root = tempdir().unwrap();
     let socket = root.path().join("checkpoint.sock");

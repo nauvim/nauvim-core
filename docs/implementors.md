@@ -268,10 +268,10 @@ loop {
 ```
 
 A plugin host switch produces `Welcome`, then `Connect { host }`. The next call
-to `Engine::next_event()` starts the destination connection. To supply a checkpoint
-for that destination, call `Engine::connect_with_checkpoint()` before receiving
-another event. The explicit connection supersedes the pending automatic
-connection. Cleanup events for the previous attachment can arrive while the
+to `Engine::next_event()` starts the destination connection. To supply a
+checkpoint, explicitly connect to the host alias with a
+[checkpoint method](#restoring-ui-checkpoints) before receiving another event.
+The explicit connection supersedes the pending automatic connection. Cleanup events for the previous attachment can arrive while the
 destination is connecting or already active. Continue applying those events
 to the windows identified by their handles.
 
@@ -302,9 +302,9 @@ The engine does not call the backend or automatically receive its error value.
 
 Call `Engine::checkpoint()` while the attachment is active to capture its
 latest committed UI state, including hidden grids. The checkpoint can include
-redraws whose frames the frontend has yet to receive. A fresh attachment's
-first redraw flush makes its initial checkpoint available. Capture a checkpoint
-before ending the attachment.
+redraws whose frames the frontend has yet to receive. The first redraw flush
+makes a checkpoint available for fresh attachments and those using a checkpoint
+as a reference. Capture a checkpoint before ending the attachment.
 
 The caller owns checkpoint storage and must match a checkpoint to the same
 running Neovim process that produced it. A host alias identifies a connection
@@ -312,16 +312,26 @@ destination and can point to a replacement process. Use `Checkpoint::encode()`
 and `Checkpoint::decode()` to convert between checkpoints and bytes. See the
 [nvim-rpc-ui reference][ui-crate].
 
-Supply the checkpoint to `Engine::connect_with_checkpoint()` for a host alias,
-`Engine::connect_default_with_checkpoint()` for the default local host, or
-`Engine::start_with_checkpoint()` for automatic startup selection. These
-methods reattach to a running Neovim. A missing session or an invalid
-checkpoint follows the regular connection failure path. Use the ordinary
-connection methods to start a fresh session. The engine passes an accepted
-checkpoint to `nvim-rpc-ui` before attaching the UI.
+Choose how to apply the checkpoint.
 
-The first frame of a restored attachment requests a full repaint. Present it
-through the ordinary frame path. Its events come from the new attachment.
+| Connection selection | Restore the saved snapshot | Use the checkpoint as a reference |
+| --- | --- | --- |
+| Host alias | `Engine::connect_with_checkpoint()` | `Engine::connect_with_checkpoint_reference()` |
+| Default local host | `Engine::connect_default_with_checkpoint()` | `Engine::connect_default_with_checkpoint_reference()` |
+| Startup selection | `Engine::start_with_checkpoint()` | `Engine::start_with_checkpoint_reference()` |
+
+Snapshot restoration seeds the UI model with saved state. Reference mode starts
+with an empty model and uses the checkpoint to supply missing data for current
+redraw events. The [UI model documentation][ui-crate] defines which data can be
+recovered.
+
+Both modes reattach to a running Neovim. A missing session or an invalid
+checkpoint follows the regular connection failure path. Use the ordinary
+connection methods to start a fresh session. The engine passes the checkpoint
+to the receiving UI model before attaching the UI.
+
+The first redraw frame requests a full repaint. Present it through the ordinary
+frame path. Its events come from the new attachment.
 Restoration uses new connections and attachment resources. The outgoing
 attachment follows the [ordinary cleanup procedure](#errors-detachment-and-shutdown).
 

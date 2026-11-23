@@ -1,9 +1,10 @@
+use crate::connection::CheckpointUse;
 use crate::resources::Registry;
 #[cfg(feature = "ssh")]
 use crate::resources::Remote;
 #[cfg(feature = "plugin-clipboard")]
 use crate::resources::clipboard::Clipboard;
-use crate::{Checkpoint, ClientId, Config, Error, Policies, Transport};
+use crate::{ClientId, Config, Error, Policies, Transport};
 
 use super::{ATTACH_TIMEOUT, Attachment, CHECK_TIMEOUT, EngineEvent};
 
@@ -37,7 +38,7 @@ impl Attempt {
         alias: Option<String>,
         width: u32,
         height: u32,
-        checkpoint: Option<Checkpoint>,
+        checkpoint: Option<CheckpointUse>,
         stop: CancellationToken,
     ) -> Result<Attachment, Error> {
         let result = tokio::select! {
@@ -64,7 +65,7 @@ impl Attempt {
         alias: Option<&str>,
         width: u32,
         height: u32,
-        checkpoint: Option<Checkpoint>,
+        checkpoint: Option<CheckpointUse>,
     ) -> Result<(), Error> {
         use crate::connection;
         #[cfg(feature = "plugin-http")]
