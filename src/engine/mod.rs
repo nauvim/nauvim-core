@@ -430,12 +430,12 @@ impl Engine {
         .await
     }
 
-    /// Starts or reuses the independent default local host.
+    /// Starts or reuses the independent default host.
     pub async fn connect_default(&mut self, width: u32, height: u32) -> Result<(), Error> {
         self.connect_selection(None, width, height, None).await
     }
 
-    /// Reattaches to the default local host with a caller-supplied checkpoint.
+    /// Reattaches to the default host with a caller-supplied checkpoint.
     ///
     /// Uses the same checkpoint and frame contract as
     /// [`Self::connect_with_checkpoint()`].
@@ -454,7 +454,7 @@ impl Engine {
         .await
     }
 
-    /// Reattaches to the default local host using a checkpoint as a reference.
+    /// Reattaches to the default host using a checkpoint as a reference.
     ///
     /// Uses the same checkpoint and frame contract as
     /// [`Self::connect_with_checkpoint_reference()`].

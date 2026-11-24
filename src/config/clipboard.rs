@@ -39,24 +39,10 @@ impl ClipboardConfig {
     pub(crate) fn parse(value: Value, diagnostics: &mut Vec<String>) -> Result<Self, Error> {
         let mut ret = Self::default();
         match value {
-            Value::Nil => {}
             Value::String(s) => ret.backend = lua_string(&s, "clipboard")?.to_string(),
             Value::Table(t) => {
-                for pair in t.clone().pairs::<Value, Value>() {
-                    let (key, _) = pair?;
-                    if !matches!(&key, Value::String(s) if s.as_bytes().as_ref() == b"backend" || s.as_bytes().as_ref() == b"timeout_ms")
-                    {
-                        return Err(Error::Message(
-                            "Unknown clipboard configuration field".into(),
-                        ));
-                    }
-                }
-                match t.get::<Value>("backend")? {
-                    Value::Nil => {}
-                    Value::String(backend) => {
-                        ret.backend = lua_string(&backend, "clipboard.backend")?.to_string()
-                    }
-                    _ => return Err(Error::Message("clipboard.backend must be a string".into())),
+                if let Value::String(s) = t.get("backend")? {
+                    ret.backend = lua_string(&s, "clipboard.backend")?.to_string();
                 }
                 match t.get::<Value>("timeout_ms")? {
                     Value::Nil => {}
@@ -64,18 +50,14 @@ impl ClipboardConfig {
                         if let Ok(n) = u64::try_from(n) {
                             ret.timeout = Duration::from_millis(n);
                         }
-                    },
+                    }
                     _ => diagnostics.push(format!(
                         "clipboard.timeout_ms must have integer type and be at least 1; using {} ms",
                         ret.timeout.as_millis()
                     )),
                 }
             }
-            _ => {
-                return Err(Error::Message(
-                    "clipboard must be a backend string or table".into(),
-                ));
-            }
+            _ => {}
         }
         Ok(ret)
     }
@@ -145,20 +127,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_configuration_shapes_and_backend_types() {
-        let lua = Lua::new();
-        for src in [
-            "return false",
-            "return 42",
-            "return {backend=42,timeout_ms=3}",
-            "return {backend='auto',timeout_ms=3,unknown=true}",
-            "return {backend='auto',['timeout-ms']=3}",
+    fn omits_unsupported_clipboard_settings() {
+        for (src, timeout) in [
+            ("return false", 3000),
+            ("return 42", 3000),
+            ("return {backend=42,timeout_ms=3}", 3),
+            ("return {backend='auto',timeout_ms=3,unknown=true}", 3),
+            ("return {backend='auto',['timeout-ms']=3}", 3000),
         ] {
-            let value = lua.load(src).eval().unwrap();
-            assert!(
-                ClipboardConfig::parse(value, &mut Vec::new()).is_err(),
-                "{src}"
-            );
+            let (config, diagnostics) = parse(src);
+            assert_eq!(config.backend(), "auto", "{src}");
+            assert_eq!(config.timeout(), Duration::from_millis(timeout), "{src}");
+            assert!(diagnostics.is_empty(), "{src}");
         }
     }
 }

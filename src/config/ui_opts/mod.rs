@@ -22,32 +22,28 @@ fn require_nonempty(s: &str, field: &str) -> Result<(), Error> {
 
 pub(super) fn select(config: &Table, ui_id: &str) -> Result<UiConfig, Error> {
     let selector = match config.raw_get::<Value>("use_ui_opts")? {
-        Value::Nil => None,
         Value::String(s) => {
             let key = lua_string(&s, "use_ui_opts")?;
             require_nonempty(&key, "use_ui_opts")?;
             Some(key.to_string())
         }
-        _ => return Err(Error::Message("use_ui_opts must be a string or nil".into())),
+        _ => None,
     };
     let selected_key = selector.as_deref().unwrap_or(ui_id);
     let mapping = match config.raw_get::<Value>("ui_opts")? {
-        Value::Nil => return Ok(UiConfig::default()),
         Value::Table(t) => t,
-        _ => return Err(Error::Message("ui_opts must be a dictionary or nil".into())),
+        _ => return Ok(UiConfig::default()),
     };
     let mut selected = UiConfig::default();
     for pair in mapping.pairs::<Value, Value>() {
         let (key, value) = pair?;
         let Value::String(key) = key else {
-            return Err(Error::Message("ui_opts keys must be strings".into()));
+            continue;
         };
         let key = lua_string(&key, "ui_opts key")?;
         require_nonempty(&key, "ui_opts key")?;
         let Value::Table(table) = value else {
-            return Err(Error::Message(
-                "ui_opts entries must be dictionaries".into(),
-            ));
+            continue;
         };
         let opts = convert::from_table(table)?;
         if key.as_ref() == selected_key {

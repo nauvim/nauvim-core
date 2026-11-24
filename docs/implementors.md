@@ -117,23 +117,24 @@ implementation ID, and a parser for the selected UI-option dictionary. It
 returns the core configuration and the parser's result separately. See
 [UI-specific configuration](#ui-specific-configuration) for this interface.
 
-Loading or validation failure selects the complete default configuration. The
-engine emits retained diagnostics as client error events. An invalid clipboard
-timeout is a narrower fallback: it retains the rest of the configuration and
-uses the default timeout. See [loading configuration](usage.md#loading-configuration)
-and [clipboard settings](usage.md#clipboard).
+An absent implicit configuration file selects defaults. During validation,
+core recovers unsupported dictionary keys and value types. Other loading
+failures select the complete default configuration. The engine emits retained
+diagnostics as client error events. See
+[loading configuration](usage.md#loading-configuration).
 
 Create the engine, measure the editor viewport in cells, and call
 `Engine::start(width, height)`. Both dimensions must be positive.
 
 | Configuration | Action taken by `start()` |
 | --- | --- |
-| No host entries and no `default_host` | Connect to the independent default local host. |
-| Host entries and no `default_host` | Emit `Welcome` and wait for user selection. |
+| No host entries and a table or nil `default_host` | Connect to the independent default host. |
+| Host entries and a table or nil `default_host` | Emit `Welcome` and wait for user selection. |
 | A non-empty `default_host` alias | Connect to that alias. |
 
-Build the welcome page from `Config::hosts()` plus a separate default-local-host
-choice. `Engine::connect_default()` selects that independent choice.
+Build the welcome page from `Config::hosts()` plus an independent default host
+choice. `Engine::connect_default()` selects it and uses the configured
+`default_host` table when present.
 `Engine::connect(alias, width, height)` selects a named host. Aliases named
 `local` and `default` are ordinary aliases, not reserved choices. An alias
 absent from the configuration uses SSH resolution when SSH is enabled.
@@ -162,12 +163,14 @@ with its option schema: field names, types, meanings, and defaults. The ID
 identifies the implementation across launches. Reverse domain name notation,
 such as `org.example.nauvim.gui`, is recommended. It must be non-empty valid
 UTF-8, must not begin with U+FEFF, and must not contain NUL. Core rejects an
-invalid supplied ID before reading or executing configuration.
+invalid supplied ID before reading or executing configuration. Lua configuration
+can read the supplied ID from `require("nauvim-client-info").ui_id`.
 
 `Config::load()` passes an owned `UiConfig` containing the selected dictionary to
 your parser after common configuration validation. It contains pure Rust data
 and can outlive the core configuration and engine. Parse it into your
-application's settings and return schema failures as `nauvim_core::Error`. Core
+application's settings. Apply the dictionary recovery rules to your schema and
+return remaining validation failures as `nauvim_core::Error`. Core
 returns `(Config, T)`, where `T` is your parser's result type. Use `Ok` as the
 parser to receive `UiConfig` directly. See
 [UI-specific settings](usage.md#ui-specific-configuration) for mapping validation
@@ -191,9 +194,11 @@ struct GuiOptions {
 
 fn parse_ui_opts(opts: UiConfig) -> Result<GuiOptions, Error> {
     let font_size = match opts.get("font_size") {
-        None => 12,
         Some(UiValue::Integer(n)) if *n > 0 => *n,
-        _ => return Err(Error::Message("font_size must be a positive integer".into())),
+        Some(UiValue::Integer(_)) => {
+            return Err(Error::Message("font_size must be positive".into()));
+        }
+        _ => 12,
     };
 
     Ok(GuiOptions { font_size })
@@ -209,10 +214,12 @@ The parser runs only for the selected dictionary. Common validation also checks
 unselected dictionaries, but their fields are not interpreted against your
 schema. UI options remain distinct from Neovim UI attachment options.
 
-If reading, evaluation, common validation, or your parser fails, `Config::load()`
-discards the configuration and invokes your parser with an empty dictionary.
-It returns complete core defaults, your parsed UI defaults, and the original
-error in `Config::diagnostics()`. Your parser must accept an empty dictionary to
+If reading, evaluation, common validation, or your parser fails,
+`Config::load()` discards the configuration and invokes your parser with an
+empty dictionary. An absent implicit configuration file also supplies an empty
+dictionary and generates no loading diagnostic.
+It returns complete core defaults and your parsed UI defaults. When loading or
+validation failed, `Config::diagnostics()` also contains the original error. Your parser must accept an empty dictionary to
 construct those defaults. If it rejects that dictionary, loading returns an
 error. `Config::evaluate()` accepts the same ID and parser interface but returns
 evaluation or schema errors directly, without the file-loading fallback.
@@ -723,6 +730,6 @@ The core's own tests validate engine behaviour, not your toolkit adapter.
 See [development and validation](development.md) for those checks and the
 requirements of the optional live integration suites.
 
-[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.0.1/specification.md
+[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.1.0/specification.md
 [ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.3/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/

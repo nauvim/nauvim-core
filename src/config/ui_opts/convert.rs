@@ -45,20 +45,21 @@ pub(super) fn from_table(root: Table) -> Result<UiConfig, Error> {
         let id = *id;
         pending.push(Visit::Finish(ptr));
 
-        let mut pairs = table.pairs::<Value, Value>().peekable();
-        let is_list = id.0 != 0 && matches!(pairs.peek(), Some(Ok((Value::Integer(_), _))));
+        let is_list = id.0 != 0 && list_form(&table)?;
         let mut entries = Vec::new();
-        for pair in pairs {
+        for pair in table.pairs::<Value, Value>() {
             let (key, value) = pair?;
             let key = match key {
                 Value::Integer(n) if is_list => UiValue::Integer(n),
                 Value::String(s) if !is_list => {
                     UiValue::String(lua_string(&s, "UI option dictionary key")?.to_string())
                 }
-                _ => return Err(Error::Message(
-                    "UI option tables must be dictionaries with string keys or contiguous lists"
-                        .into(),
-                )),
+                _ if !is_list => continue,
+                _ => {
+                    return Err(Error::Message(
+                        "UI option lists must have integer keys".into(),
+                    ));
+                }
             };
             let value = match value {
                 Value::Nil => UiValue::Nil,
@@ -78,9 +79,10 @@ pub(super) fn from_table(root: Table) -> Result<UiConfig, Error> {
                     }
                     UiValue::Table(*id)
                 }
+                _ if !is_list => continue,
                 value => {
                     return Err(Error::Message(format!(
-                        "Unsupported UI option value type: {}",
+                        "Unsupported UI option list element type: {}",
                         value.type_name()
                     )));
                 }
@@ -112,6 +114,18 @@ pub(super) fn from_table(root: Table) -> Result<UiConfig, Error> {
     Ok(config)
 }
 
+fn list_form(t: &Table) -> Result<bool, Error> {
+    let mut has_index = false;
+    for pair in t.pairs::<Value, Value>() {
+        match pair?.0 {
+            Value::String(_) => return Ok(false),
+            Value::Integer(_) => has_index = true,
+            _ => {}
+        }
+    }
+    Ok(has_index)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,17 +148,13 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_rejects_objects_outside_the_ui_value_domain() {
+    fn snapshot_rejects_invalid_list_entries() {
         let lua = Lua::new();
         for source in [
-            "return {nested={[function() end]=true}}",
             "return {nested={function() end}}",
-            "return {nested={[{}]=true}}",
-            "return {nested=coroutine.create(function() end)}",
-            "return {nested=io.stdout}",
             "return {nested={[-1]=true}}",
             "return {nested={[2]=true}}",
-            "return {nested={true, named=true}}",
+            "return {nested={true,[false]=true}}",
         ] {
             let table = lua.load(source).eval::<Table>().unwrap();
             assert!(from_table(table).is_err(), "{source}");

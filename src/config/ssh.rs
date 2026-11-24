@@ -1,5 +1,6 @@
 use crate::Error;
 
+use super::ssh_input::{self, Field};
 use super::{Config, HostInfo, lua_string};
 
 use mlua::{Table, Value};
@@ -124,15 +125,16 @@ fn sequence(table: Table, field: &str) -> Result<Vec<Value>, Error> {
         .map_err(Error::from)
 }
 
-fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
+fn native(table: &Table) -> Result<Settings, Error> {
     let mut settings = Settings::default();
-    for pair in table.clone().pairs::<Value, Value>() {
-        let (key, value) = pair?;
-        let field = string(key, "field name")?;
-        match field.as_str() {
-            "host_name" => settings.host_name = Some(string(value, &field)?),
-            "user" => settings.user = Some(string(value, &field)?),
-            "port" => {
+    for entry in ssh_input::entries(table) {
+        use Field::*;
+
+        let (field, value) = entry?;
+        match field {
+            HostName => settings.host_name = Some(string(value, "host_name")?),
+            User => settings.user = Some(string(value, "user")?),
+            Port => {
                 let port = match value {
                     Value::Integer(n) => u16::try_from(n).ok(),
                     Value::String(s) => {
@@ -150,12 +152,12 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
                 })?;
                 settings.port = Some(port);
             }
-            "identity_file" => {
-                settings.identities = Some(vec![path(value, &field)?]);
+            IdentityFile => {
+                settings.identities = Some(vec![path(value, "identity_file")?]);
             }
-            "certificate_file" => settings.certificate = Some(path(value, &field)?),
-            "identity_agent" => settings.agent = Some(Some(path(value, &field)?)),
-            "identities_only" => {
+            CertificateFile => settings.certificate = Some(path(value, "certificate_file")?),
+            IdentityAgent => settings.agent = Some(Some(path(value, "identity_agent")?)),
+            IdentitiesOnly => {
                 settings.identities_only = Some(match value {
                     Value::Boolean(value) => value,
                     Value::String(value) => {
@@ -179,16 +181,22 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
                     }
                 })
             }
-            "proxy_jump" => settings.jumps = Some(jumps(value)?),
-            "kex_algorithms" | "host_key_algorithms" => {
+            ProxyJump => settings.jumps = Some(jumps(value)?),
+            KexAlgorithms | HostKeyAlgorithms => {
+                let keys = matches!(field, HostKeyAlgorithms);
+                let field = if keys {
+                    "host_key_algorithms"
+                } else {
+                    "kex_algorithms"
+                };
                 let values = match value {
-                    Value::String(s) => lua_string(&s, &field)?
+                    Value::String(s) => lua_string(&s, field)?
                         .split(',')
                         .map(str::to_owned)
                         .collect(),
-                    Value::Table(table) => sequence(table, &field)?
+                    Value::Table(table) => sequence(table, field)?
                         .into_iter()
-                        .map(|value| string(value, &field))
+                        .map(|value| string(value, field))
                         .collect::<Result<Vec<_>, _>>()?,
                     _ => {
                         return Err(message(format!(
@@ -196,7 +204,6 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
                         )));
                     }
                 };
-                let keys = field == "host_key_algorithms";
                 apply_algorithms(&values, keys)?;
                 if keys {
                     settings.keys = Some(values);
@@ -204,7 +211,6 @@ fn native(table: &Table, _depth: usize) -> Result<Settings, Error> {
                     settings.kex = Some(values);
                 }
             }
-            _ => return Err(message(format!("Unknown SSH field: {field}"))),
         }
     }
     Ok(settings)
@@ -223,14 +229,7 @@ fn jumps(value: Value) -> Result<Vec<Jump>, Error> {
     match value {
         Value::String(_) => Ok(vec![jump(value)?]),
         Value::Table(table) => {
-            let mut has_named_field = false;
-            for pair in table.clone().pairs::<Value, Value>() {
-                if matches!(pair?.0, Value::String(_)) {
-                    has_named_field = true;
-                    break;
-                }
-            }
-            if has_named_field {
+            if ssh_input::inline_jump(&table)? {
                 Ok(vec![jump(Value::Table(table))?])
             } else {
                 sequence(table, "proxy_jump")?
@@ -245,7 +244,7 @@ fn jumps(value: Value) -> Result<Vec<Jump>, Error> {
     }
 }
 
-pub(crate) fn validate(table: &Table, _depth: usize) -> Result<(), Error> {
+pub(super) fn validate(table: &Table) -> Result<(), Error> {
     let mut pending = vec![table.clone()];
     let mut validated = HashSet::new();
     while let Some(table) = pending.pop() {
@@ -254,7 +253,7 @@ pub(crate) fn validate(table: &Table, _depth: usize) -> Result<(), Error> {
         if !validated.insert(table.to_pointer()) {
             continue;
         }
-        let settings = native(&table, 0)?;
+        let settings = native(&table)?;
         if let Some(jumps) = settings.jumps {
             for jump in jumps {
                 if let Jump::Inline(table) = jump {
@@ -501,7 +500,7 @@ impl Resolver<'_> {
         let Some(table) = native_table else {
             return self.openssh(alias);
         };
-        let settings = native(table, 0)?;
+        let settings = native(table)?;
         let name = settings
             .host_name
             .clone()
@@ -511,7 +510,7 @@ impl Resolver<'_> {
 
     fn supplement(&mut self, name: &str, mut settings: Settings) -> Result<Settings, Error> {
         if let Some(table) = self.config.hosts.get(name).and_then(|h| h.ssh.as_ref()) {
-            settings = settings.defaults_from(native(table, 0)?);
+            settings = settings.defaults_from(native(table)?);
         }
         if settings.has_absent() {
             settings = settings.defaults_from(self.openssh(name)?);
@@ -585,7 +584,7 @@ impl Resolver<'_> {
     }
 }
 
-pub(crate) fn resolve(config: &Config, alias: &str) -> Result<Resolved, Error> {
+pub(crate) fn resolve(config: &Config, alias: Option<&str>) -> Result<Resolved, Error> {
     let user = match &config.client {
         Some(info) => info.user.clone(),
         None => HostInfo::local(None)?.user,
@@ -595,8 +594,26 @@ pub(crate) fn resolve(config: &Config, alias: &str) -> Result<Resolved, Error> {
         openssh: None,
         user,
     };
-    let settings = resolver.alias(alias)?;
-    let (target, preferred, mut jumps) = resolver.host(alias, settings)?;
+    let (target, preferred, mut jumps) = match alias {
+        Some(alias) => {
+            let settings = resolver.alias(alias)?;
+            resolver.host(alias, settings)?
+        }
+        None => {
+            let table = config
+                .default_spec
+                .ssh
+                .as_ref()
+                .ok_or_else(|| message("Default host has no native SSH settings"))?;
+            let settings = native(table)?;
+            let name = settings
+                .host_name
+                .clone()
+                .ok_or_else(|| message("Default SSH host requires host_name"))?;
+            let settings = resolver.supplement(&name, settings)?;
+            resolver.host(&name, settings)?
+        }
+    };
     let mut preferences = vec![preferred];
     let mut bastions = Vec::new();
     while !jumps.is_empty() {
@@ -619,7 +636,7 @@ pub(crate) fn resolve(config: &Config, alias: &str) -> Result<Resolved, Error> {
                     (target.host.to_owned(), settings)
                 }
                 Jump::Inline(table) => {
-                    let settings = native(&table, 0)?;
+                    let settings = native(&table)?;
                     let name = settings
                         .host_name
                         .clone()
@@ -698,7 +715,7 @@ mod tests {
             requested = { host_name = "base", identity_file = "/id/override", identities_only = false, proxy_jump = {} },
         }"#,
         );
-        let resolved = resolve(&config, "requested").unwrap();
+        let resolved = resolve(&config, Some("requested")).unwrap();
         assert_eq!(
             resolved.chain.target.dest,
             Dest {
@@ -721,15 +738,43 @@ mod tests {
     }
 
     #[test]
+    fn resolves_independent_default_ssh_host_with_native_supplementation() {
+        let mut config = config("return { base = {user='named-user',port=2222} }");
+        config.default_spec.ssh = Some(config.lua.load("return {port=2200}").eval().unwrap());
+        let error = resolve(&config, None).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("Default SSH host requires host_name")
+        );
+
+        config.default_spec.ssh = Some(
+            config
+                .lua
+                .load("return {host_name='base',user=false,port=2200}")
+                .eval()
+                .unwrap(),
+        );
+        let resolved = resolve(&config, None).unwrap();
+        assert_eq!(
+            resolved.chain.target.dest,
+            Dest {
+                name: "base".to_owned(),
+                user: "named-user".to_owned(),
+                port: 2200
+            },
+        );
+    }
+    #[test]
     fn native_self_merge_retains_literal_name_and_applies_defaults_after_source() {
         let config = config(r#"return { ["literal*?!"] = { port = "0" } }"#);
-        let resolved = resolve(&config, "literal*?!").unwrap();
+        let resolved = resolve(&config, Some("literal*?!")).unwrap();
         assert_eq!(resolved.chain.target.dest.name, "literal*?!");
         assert_eq!(resolved.chain.target.dest.user, "client-user");
         assert_eq!(resolved.chain.target.dest.port, 0);
         assert!(resolved.chain.target.auth.agent.is_none());
         assert_eq!(
-            resolve(&config, "LITERAL*?!")
+            resolve(&config, Some("LITERAL*?!"))
                 .unwrap()
                 .chain
                 .target
@@ -745,29 +790,27 @@ mod tests {
 
         let lua = Lua::new();
         for src in [
-            "return {request_tty=false}",
             "return {port=65536}",
-            "return {port=22.5}",
             "return {port='-1'}",
             "return {identity_agent='none'}",
             "return {identity_file='~/.ssh/id'}",
             "return {certificate_file=''}",
             "return {identities_only='maybe'}",
-            "return {user=1}",
             "return {kex_algorithms={}}",
-            "return {proxy_jump={{host_name='jump',unsupported=true}}}",
             "return {proxy_jump={{host_name='jump',proxy_jump={identity_agent='relative'}}}}",
         ] {
             let table = lua.load(src).eval::<Table>().unwrap();
-            assert!(validate(&table, 0).is_err(), "{src}");
+            assert!(validate(&table).is_err(), "{src}");
         }
         for src in [
             "return {identities_only='YES',port='65535'}",
             "return {identities_only='nO',identity_file='/missing/id'}",
             "return {proxy_jump={}}",
+            "return {request_tty=false,port=22.5,user=1}",
+            "return {proxy_jump={{host_name='jump',unsupported=true}}}",
         ] {
             assert!(
-                validate(&lua.load(src).eval::<Table>().unwrap(), 0).is_ok(),
+                validate(&lua.load(src).eval::<Table>().unwrap()).is_ok(),
                 "{src}"
             );
         }
@@ -775,7 +818,7 @@ mod tests {
             .load("local t = {}; t.proxy_jump=t; return t")
             .eval::<Table>()
             .unwrap();
-        assert!(validate(&table, 0).is_ok());
+        assert!(validate(&table).is_ok());
     }
 
     #[test]
@@ -784,7 +827,7 @@ mod tests {
         let mut config = config(r#"return { native = {host_name='real',identities_only=false} }"#);
         config.ssh_config = dir.path().join("config");
         fs::write(&config.ssh_config, "Host real\n HostName server.test\n User ssh-user\n Port 2345\n IdentitiesOnly yes\n RequestTTY force\n IdentityAgent none\n IdentityFile /ssh/id\n").unwrap();
-        let native = resolve(&config, "native").unwrap();
+        let native = resolve(&config, Some("native")).unwrap();
         assert_eq!(
             native.chain.target.dest,
             Dest {
@@ -800,12 +843,12 @@ mod tests {
         assert!(!native.chain.target.auth.identities_only);
         assert!(native.chain.target.auth.agent.is_none());
         assert_eq!(native.chain.target.tty, RequestTty::Never);
-        let external = resolve(&config, "real").unwrap();
+        let external = resolve(&config, Some("real")).unwrap();
         assert_eq!(external.chain.target.dest.name, "server.test");
         assert!(external.chain.target.auth.identities_only);
         assert_eq!(external.chain.target.tty, RequestTty::Never);
         fs::write(&config.ssh_config, "Host real\n Port invalid\n").unwrap();
-        assert!(resolve(&config, "native").is_err());
+        assert!(resolve(&config, Some("native")).is_err());
     }
 
     #[test]
@@ -818,7 +861,7 @@ mod tests {
             ancestor = {},
         }"#,
         );
-        let resolved = resolve(&config, "target").unwrap();
+        let resolved = resolve(&config, Some("target")).unwrap();
         let bastions = resolved.chain.bastions.unwrap();
         assert_eq!(
             bastions
@@ -841,7 +884,7 @@ mod tests {
         );
         config.ssh_config = dir.path().join("config");
         fs::write(&config.ssh_config, "Host target\n Port 2222\nHost jump\n IdentityFile /ssh/jump-id\n User openssh-user\n Port 23\n").unwrap();
-        let resolved = resolve(&config, "target").unwrap();
+        let resolved = resolve(&config, Some("target")).unwrap();
         assert_eq!(resolved.chain.target.dest.port, 2222);
         let bastions = resolved.chain.bastions.unwrap();
         let jump = bastions.first().unwrap();
@@ -854,7 +897,7 @@ mod tests {
         );
         fs::remove_file(&config.ssh_config).unwrap();
         assert!(
-            resolve(&config, "target")
+            resolve(&config, Some("target"))
                 .err()
                 .unwrap()
                 .to_string()
@@ -875,7 +918,7 @@ mod tests {
             }
         }
         let config = config("return {target={kex_algorithms='curve25519-sha256'}}");
-        let resolved = resolve(&config, "target").unwrap();
+        let resolved = resolve(&config, Some("target")).unwrap();
         let preferred = &resolved.preferences.first().unwrap().preferred;
         assert_eq!(preferred.kex.first().unwrap().as_ref(), "curve25519-sha256");
         assert!(
@@ -918,7 +961,7 @@ mod tests {
         let config = config(
             r#"return {target={host_key_algorithms={'ssh-ed25519-cert-v01@openssh.com','ssh-ed25519'}}}"#,
         );
-        let resolved = resolve(&config, "target").unwrap();
+        let resolved = resolve(&config, Some("target")).unwrap();
         let preferred = resolved.preferences.first().unwrap();
         assert!(preferred.host_keys_explicit);
         assert_eq!(

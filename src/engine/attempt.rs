@@ -1,3 +1,4 @@
+use crate::config::Host;
 use crate::connection::CheckpointRole;
 use crate::resources::Registry;
 #[cfg(feature = "ssh")]
@@ -79,27 +80,18 @@ impl Attempt {
 
         use std::sync::atomic::AtomicBool;
 
-        #[cfg(feature = "ssh")]
-        let is_remote =
-            alias.is_some_and(|alias| self.config.hosts.get(alias).is_none_or(|h| h.ssh.is_some()));
-        #[cfg(not(feature = "ssh"))]
-        let is_remote =
-            alias.is_some_and(|alias| self.config.hosts.get(alias).is_none_or(|h| h.remote));
+        let host = self.config.host(alias);
         let reuse_only = checkpoint.is_some();
-        let (transport, _policies, _remote) = if is_remote {
+        let (transport, _policies, _remote) = if let Some(host) = host.filter(|h| !h.is_remote()) {
+            let (transport, policies) = self.open_local(host, alias, reuse_only).await?;
+            (transport, policies, None::<RemoteMarker>)
+        } else {
             #[cfg(feature = "ssh")]
             {
                 use crate::ssh;
 
-                let alias =
-                    alias.ok_or_else(|| Error::Message("Missing remote host alias".into()))?;
                 let (transport, remote) = ssh::open(&self.config, alias, reuse_only).await?;
-                let policies = self
-                    .config
-                    .hosts
-                    .get(alias)
-                    .map(|h| h.policies.clone())
-                    .unwrap_or_default();
+                let policies = host.map(|h| h.policies.clone()).unwrap_or_default();
                 (transport, policies, Some(remote))
             }
             #[cfg(not(feature = "ssh"))]
@@ -108,9 +100,6 @@ impl Attempt {
                     "SSH support is disabled in this build".into(),
                 ));
             }
-        } else {
-            let (transport, policies) = self.open_local(alias, reuse_only).await?;
-            (transport, policies, None::<RemoteMarker>)
         };
         let (events_tx, events) = mpsc::unbounded_channel();
         let resources = Resources::with_registry(
@@ -309,6 +298,7 @@ impl Attempt {
 
     async fn open_local(
         &self,
+        host: &Host,
         alias: Option<&str>,
         reuse_only: bool,
     ) -> Result<(Transport, Policies), Error> {
@@ -320,14 +310,6 @@ impl Attempt {
 
         use std::process::Stdio;
 
-        let host = match alias {
-            Some(alias) => self
-                .config
-                .hosts
-                .get(alias)
-                .ok_or_else(|| Error::Message(format!("Unknown host {alias}")))?,
-            None => &self.config.default_spec,
-        };
         let needs_info =
             host.nvim.needs_info() || host.socket.as_ref().is_some_and(|s| s.needs_info());
         let info = if needs_info {
