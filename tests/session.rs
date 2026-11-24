@@ -114,6 +114,39 @@ async fn quit(engine: &mut Engine) {
 }
 
 #[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6"]
+async fn uses_the_configured_default_host_for_automatic_startup() {
+    let root = tempdir().unwrap();
+    let file = root.path().join("config.lua");
+    let socket = root.path().join("default.sock");
+    let bin = env::var("NVIM_BIN").expect("set NVIM_BIN to Neovim v0.12.6");
+    let src = format!(
+        r#"return {{default_host={{
+            nvim = {{prog = {}, args = {{"-u", "NONE", "-i", "NONE", "-n"}},
+                env = {{NAUVIM_TEST_DEFAULT_HOST = "configured"}}}},
+            socket = {},
+        }}}}"#,
+        lua_string(&bin),
+        lua_string(socket.to_str().unwrap()),
+    );
+    fs::write(&file, src).unwrap();
+    let (config, ()) =
+        Config::load(Some(&file), "org.example.nauvim.session-test", |_| Ok(())).unwrap();
+    assert!(config.diagnostics().is_empty());
+    let mut engine = Engine::new(config).unwrap();
+    engine.start(60, 16).await.unwrap();
+    let client = engine.client().unwrap();
+    let configured = lua_bool(
+        &client,
+        "return vim.env.NAUVIM_TEST_DEFAULT_HOST == 'configured'",
+    )
+    .await;
+    quit(&mut engine).await;
+
+    assert!(configured);
+}
+
+#[tokio::test]
 async fn rejects_zero_dimensions_before_startup() {
     let mut engine = Engine::new(Config::default()).unwrap();
     for (width, height) in [(0, 20), (80, 0)] {

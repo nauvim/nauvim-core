@@ -196,7 +196,7 @@ LogLevel DEBUG2
         fs::read_to_string(self.root.path().join("sshd.log")).unwrap_or_default()
     }
 
-    fn config(&self, alias: &str, socket: Option<&Path>) -> Config {
+    fn config(&self, alias: Option<&str>, socket: Option<&Path>) -> Config {
         let startup = r#"lua package.preload['nauvim-plugin.client']=function() return {setup=function(opts) _G.nauvim_ssh_setup=opts.client_id end} end; _G.nauvim_request=function(method,...) return vim.rpcrequest(vim.api.nvim_list_uis()[1].chan,'nauvim-plugin/'..method,_G.nauvim_ssh_setup,...) end; _G.nauvim_notify=function(method,...) vim.rpcnotify(vim.api.nvim_list_uis()[1].chan,'nauvim-plugin/'..method,_G.nauvim_ssh_setup,...) end"#;
         let init = self.root.path().join("init.lua");
         fs::write(
@@ -210,18 +210,22 @@ LogLevel DEBUG2
                 lua_string(path.to_str().unwrap()),
             )
         });
+        let host_field = match alias {
+            Some(alias) => format!("hosts = {{ [{}] = host }}", lua_string(alias)),
+            None => "default_host = host".to_owned(),
+        };
         let src = format!(
             r#"
 local client = require("nauvim-client-info")
 local function check_host(info)
-    assert(info.config_file == nil)
+    assert(info.config_file == nil and info.ui_id == nil)
+    assert(client.ui_id == 'org.example.nauvim.ssh-test')
     assert(info.user == client.user)
     assert(info.host_name == client.host_name)
     assert(info.home_dir:sub(1,1) == "/")
     for _, path in pairs(info.project_dirs) do assert(path:sub(1,1) == "/") end
 end
-return {{
-    hosts = {{ [{}] = {{
+local host = {{
         nvim = function(info) check_host(info); return {{prog = "sh", args = {{"-c", {}, "nauvim", {}, "-u", {}, "-i", "NONE", "-n", "--cmd", {}}}, env = {{NAUVIM_LITERAL = {}, NAUVIM_ARGV_FILE = {}, NAUVIM_CONNECTION = "configured"}}}} end,
         {socket}
         policies = {{plugin = {{
@@ -232,11 +236,12 @@ return {{
             identity_file = {}, identities_only = true,
             host_key_algorithms = {{"ssh-ed25519"}}, kex_algorithms = {{"curve25519-sha256"}},
         }},
-    }} }},
+}}
+return {{
+    {host_field},
     ssh = {{ config = {}, known_hosts = {} }},
 }}
 "#,
-            lua_string(alias),
             lua_string(r#"printf '%s\0' "$@" > "$NAUVIM_ARGV_FILE"; exec "$@""#),
             lua_string(self.nvim.to_str().unwrap()),
             lua_string(init.to_str().unwrap()),
@@ -463,10 +468,37 @@ async fn copy(client: &Client, root: &Path, base: &Path) {
 
 #[tokio::test]
 #[ignore = "Requires local sshd, ssh-keygen, NVIM_BIN v0.12.6, and loopback/Unix socket permissions"]
+async fn connects_to_an_independent_default_ssh_host() {
+    let mut server = Server::start().await;
+    let conf = server.config(None, Some(&server.socket));
+    assert!(conf.diagnostics().is_empty());
+    let mut engine = Engine::new(conf).unwrap();
+    engine.start(60, 16).await.unwrap();
+    let client = engine.client().unwrap();
+    server.host_pid = Some(integer(&client, "return vim.fn.getpid()").await);
+    assert_eq!(
+        integer(
+            &client,
+            "return vim.env.NAUVIM_CONNECTION == 'ssh' and 1 or 0"
+        )
+        .await,
+        1
+    );
+    wait_setup(&client, engine.client_id()).await;
+
+    let _ = client.command("qa!").await;
+    assert_eq!(welcome(&mut engine).await, None);
+    engine.shutdown().await.unwrap();
+    server.host_pid = None;
+    server.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "Requires local sshd, ssh-keygen, NVIM_BIN v0.12.6, and loopback/Unix socket permissions"]
 async fn remote_reopens_a_short_default_socket() {
     let mut server = Server::start().await;
     let alias = server.root.path().file_name().unwrap().to_str().unwrap();
-    let mut first = Engine::new(server.config(alias, None)).unwrap();
+    let mut first = Engine::new(server.config(Some(alias), None)).unwrap();
     first.connect(alias, 60, 16).await.unwrap();
     let client = first.client().unwrap();
     let pid = integer(&client, "return vim.fn.getpid()").await;
@@ -478,7 +510,7 @@ async fn remote_reopens_a_short_default_socket() {
         .unwrap();
     first.shutdown().await.unwrap();
 
-    let mut second = Engine::new(server.config(alias, None)).unwrap();
+    let mut second = Engine::new(server.config(Some(alias), None)).unwrap();
     second.connect(alias, 60, 16).await.unwrap();
     let client = second.client().unwrap();
     assert_eq!(integer(&client, "return vim.fn.getpid()").await, pid);
@@ -500,7 +532,7 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
     timeout(Duration::from_secs(60), async {
         let mut server = Server::start().await;
         drop(UnixListener::bind(&server.socket).unwrap());
-        let mut engine = Engine::new(server.config("remote", Some(&server.socket))).unwrap();
+        let mut engine = Engine::new(server.config(Some("remote"), Some(&server.socket))).unwrap();
         engine.connect("remote", 60, 16).await.unwrap();
         let client = engine.client().unwrap();
         let pid = integer(&client, "return vim.fn.getpid()").await;
@@ -559,7 +591,8 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
             format!("[127.0.0.1]:{} {different_key}", server.port),
         )
         .unwrap();
-        let mut rejected = Engine::new(server.config("remote", Some(&server.socket))).unwrap();
+        let mut rejected =
+            Engine::new(server.config(Some("remote"), Some(&server.socket))).unwrap();
         assert!(
             rejected.connect("remote", 60, 16).await.is_err(),
             "Mismatched known host key was accepted"
@@ -568,7 +601,7 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
         assert!(server.socket.exists());
         fs::write(&known, original).unwrap();
 
-        let mut engine = Engine::new(server.config("remote", Some(&server.socket))).unwrap();
+        let mut engine = Engine::new(server.config(Some("remote"), Some(&server.socket))).unwrap();
         engine
             .connect_with_checkpoint("remote", 60, 16, checkpoint.clone())
             .await
@@ -648,7 +681,7 @@ async fn remote_attachment_sftp_forwarding_and_persistent_reattachment() {
 
         let occupied = server.root.path().join("ordinary-file");
         fs::write(&occupied, b"must survive").unwrap();
-        let mut engine = Engine::new(server.config("remote", Some(&occupied))).unwrap();
+        let mut engine = Engine::new(server.config(Some("remote"), Some(&occupied))).unwrap();
         assert!(engine.connect("remote", 60, 16).await.is_err());
         assert_eq!(fs::read(&occupied).unwrap(), b"must survive");
         engine.shutdown().await.unwrap();

@@ -2,7 +2,7 @@ use crate::Error;
 
 use super::{HostInfo, lua_string};
 
-use mlua::{Function, Lua, Value};
+use mlua::{Function, Lua, Table, Value};
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -39,9 +39,11 @@ impl Default for ProgramSetting {
 impl ProgramSetting {
     pub(crate) fn parse(value: Value) -> Result<Option<Self>, Error> {
         match value {
-            Value::Nil => Ok(None),
             Value::Function(f) => Ok(Some(Self::Function(f))),
-            value => program(value).map(Self::Value).map(Some),
+            value @ (Value::String(_) | Value::Table(_)) => {
+                program(value, Fields::Recover).map(Self::Value).map(Some)
+            }
+            _ => Ok(None),
         }
     }
 
@@ -60,7 +62,7 @@ impl ProgramSetting {
                 let info = info.ok_or_else(|| {
                     Error::Message("Host information is unavailable for the Neovim program".into())
                 })?;
-                program(f.call::<Value>(info.table(lua)?)?).map(Cow::Owned)
+                program(f.call::<Value>(info.table(lua)?)?, Fields::Strict).map(Cow::Owned)
             }
         }
     }
@@ -73,10 +75,7 @@ fn string(value: Value, field: &str) -> Result<String, Error> {
     }
 }
 
-fn sequence(value: Value) -> Result<Vec<String>, Error> {
-    let Value::Table(table) = value else {
-        return Err(Error::Message("nvim.args must be a string sequence".into()));
-    };
+fn sequence(table: Table) -> Result<Vec<String>, Error> {
     let len = table.raw_len();
     let mut count = 0_usize;
     for pair in table.clone().pairs::<Value, Value>() {
@@ -102,27 +101,45 @@ fn sequence(value: Value) -> Result<Vec<String>, Error> {
         .collect()
 }
 
-fn environment(value: Value) -> Result<BTreeMap<String, String>, Error> {
-    let Value::Table(table) = value else {
-        return Err(Error::Message(
-            "nvim.env must map names to string values".into(),
-        ));
-    };
+fn environment(table: Table, fields: Fields) -> Result<BTreeMap<String, String>, Error> {
     let mut env = BTreeMap::new();
     for pair in table.pairs::<Value, Value>() {
         let (key, value) = pair?;
-        let key = string(key, "nvim.env name")?;
+        let Value::String(key) = key else {
+            if matches!(fields, Fields::Strict) {
+                return Err(Error::Message("nvim.env names must be strings".into()));
+            }
+            continue;
+        };
+        let key = lua_string(&key, "nvim.env name")?;
         if key.is_empty() || key.contains('=') {
             return Err(Error::Message(
                 "nvim.env names must be nonempty and must not contain '='".into(),
             ));
         }
-        env.insert(key, string(value, "nvim.env value")?);
+        match value {
+            Value::String(v) => {
+                env.insert(
+                    key.to_string(),
+                    lua_string(&v, "nvim.env value")?.to_string(),
+                );
+            }
+            _ if matches!(fields, Fields::Strict) => {
+                return Err(Error::Message("nvim.env values must be strings".into()));
+            }
+            _ => {}
+        }
     }
     Ok(env)
 }
 
-fn program(value: Value) -> Result<Program, Error> {
+#[derive(Clone, Copy)]
+enum Fields {
+    Recover,
+    Strict,
+}
+
+fn program(value: Value, fields: Fields) -> Result<Program, Error> {
     match value {
         Value::String(value) => Ok(Program {
             prog: lua_string(&value, "nvim")?.to_string(),
@@ -130,24 +147,32 @@ fn program(value: Value) -> Result<Program, Error> {
             env: BTreeMap::new(),
         }),
         Value::Table(table) => {
-            for pair in table.clone().pairs::<Value, Value>() {
-                let field = string(pair?.0, "nvim field name")?;
-                if !matches!(field.as_str(), "prog" | "args" | "env") {
-                    return Err(Error::Message(format!("Unknown nvim field: {field}")));
+            if matches!(fields, Fields::Strict) {
+                for pair in table.pairs::<Value, Value>() {
+                    let field = string(pair?.0, "nvim field name")?;
+                    if !matches!(field.as_str(), "prog" | "args" | "env") {
+                        return Err(Error::Message(format!("Unknown nvim field: {field}")));
+                    }
                 }
             }
             Ok(Program {
-                prog: match table.get::<Value>("prog")? {
+                prog: match table.get("prog")? {
+                    Value::String(s) => lua_string(&s, "nvim.prog")?.to_string(),
                     Value::Nil => "nvim".to_owned(),
-                    value => string(value, "nvim.prog")?,
+                    _ if matches!(fields, Fields::Recover) => "nvim".to_owned(),
+                    _ => return Err(Error::Message("nvim.prog must be a string".into())),
                 },
                 args: match table.get("args")? {
+                    Value::Table(t) => sequence(t)?,
                     Value::Nil => Vec::new(),
-                    value => sequence(value)?,
+                    _ if matches!(fields, Fields::Recover) => Vec::new(),
+                    _ => return Err(Error::Message("nvim.args must be a sequence".into())),
                 },
                 env: match table.get("env")? {
+                    Value::Table(t) => environment(t, fields)?,
                     Value::Nil => BTreeMap::new(),
-                    value => environment(value)?,
+                    _ if matches!(fields, Fields::Recover) => BTreeMap::new(),
+                    _ => return Err(Error::Message("nvim.env must be a dictionary".into())),
                 },
             })
         }
@@ -192,14 +217,10 @@ mod tests {
         for src in [
             "return true",
             "return 123",
-            "return {prog=1,args={},env={}}",
             "return {prog='nvim',args={1},env={}}",
             "return {prog='nvim',args={[2]='hole'},env={}}",
             "return {prog='nvim',args={other='x'},env={}}",
-            "return {prog='nvim',args={},env={A=false}}",
-            "return {prog='nvim',args={},env={[1]='value'}}",
             "return {prog='nvim',args={},env={['A=B']='value'}}",
-            "return {prog='nvim',args={},env={},wrapper={}}",
         ] {
             assert!(parse(&lua, src).is_err(), "{src}");
         }
@@ -215,7 +236,11 @@ mod tests {
                 &Program::default()
             );
         }
-        let setting = parse(&lua, "return {args={'-u','NONE'}}").unwrap();
+        let setting = parse(
+            &lua,
+            "return {prog=1,args={'-u','NONE'},env={A=false,[1]='ignored'},wrapper={}}",
+        )
+        .unwrap();
         let program = setting.resolve(None, &lua).unwrap();
         assert_eq!(program.prog, "nvim");
         assert_eq!(program.args, ["-u", "NONE"]);
@@ -227,7 +252,7 @@ mod tests {
         use crate::ProjectDirs;
 
         let lua = Lua::new();
-        let function = parse(&lua, "return function(host) assert(host.config_file == nil); return {prog=host.home_dir..'/bin/nvim',args={'-O3'},env={USER_NAME=host.user}} end").unwrap();
+        let function = parse(&lua, "return function(host) assert(host.config_file == nil and host.ui_id == nil); return {prog=host.home_dir..'/bin/nvim',args={'-O3'},env={USER_NAME=host.user}} end").unwrap();
         assert!(function.needs_info());
         assert!(function.resolve(None, &lua).is_err());
         let info = HostInfo {

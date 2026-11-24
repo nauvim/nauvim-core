@@ -1,6 +1,6 @@
 use crate::Error;
 
-use super::{fields, lua_string};
+use super::{lua_string, table};
 
 use mlua::{Table, Value};
 use url::Url;
@@ -27,43 +27,25 @@ impl Policies {
         let Some(t) = t else {
             return Ok(policies);
         };
-        fields(&t, &["plugin"], "policies")?;
-        let Some(plugin) = section(
-            &t,
-            "plugin",
-            &["filesystem", "http", "local_forward", "clipboard"],
-            "policies.plugin",
-        )?
-        else {
+        let Some(plugin) = table(t.raw_get("plugin")?) else {
             return Ok(policies);
         };
 
-        if let Some(t) = section(&plugin, "filesystem", &["copy"], "plugin.filesystem")? {
-            policies.filesystem_copy = flag(&t, "copy", "plugin.filesystem.copy")?;
+        if let Some(t) = table(plugin.raw_get("filesystem")?) {
+            policies.filesystem_copy = flag(&t, "copy")?;
         }
-        if let Some(t) = section(&plugin, "clipboard", &["copy"], "plugin.clipboard")? {
-            policies.clipboard_copy = flag(&t, "copy", "plugin.clipboard.copy")?;
+        if let Some(t) = table(plugin.raw_get("clipboard")?) {
+            policies.clipboard_copy = flag(&t, "copy")?;
         }
-        if let Some(t) = section(
-            &plugin,
-            "http",
-            &["serve_file", "open_webview"],
-            "plugin.http",
-        )? {
-            policies.http_serve_file = flag(&t, "serve_file", "plugin.http.serve_file")?;
-            if let Some(t) = section(
-                &t,
-                "open_webview",
-                &["origins", "served_files"],
-                "plugin.http.open_webview",
-            )? {
+        if let Some(t) = table(plugin.raw_get("http")?) {
+            policies.http_serve_file = flag(&t, "serve_file")?;
+            if let Some(t) = table(t.raw_get("open_webview")?) {
                 let _origins = AllowList::parse(
                     t.raw_get("origins")?,
                     "plugin.http.open_webview.origins",
-                    parse_origin,
+                    |value| parse_origin(value).map(Some),
                 )?;
-                let _served_files =
-                    flag(&t, "served_files", "plugin.http.open_webview.served_files")?;
+                let _served_files = flag(&t, "served_files")?;
                 #[cfg(feature = "plugin-http")]
                 {
                     policies.webview = WebviewPolicy {
@@ -73,12 +55,7 @@ impl Policies {
                 }
             }
         }
-        if let Some(t) = section(
-            &plugin,
-            "local_forward",
-            &["tcp", "socket"],
-            "plugin.local_forward",
-        )? {
+        if let Some(t) = table(plugin.raw_get("local_forward")?) {
             policies.tcp = AllowList::parse(
                 t.raw_get("tcp")?,
                 "plugin.local_forward.tcp",
@@ -163,17 +140,22 @@ impl<T> AllowList<T> {
     fn parse(
         value: Value,
         context: &str,
-        parse_entry: impl Fn(Value) -> Result<T, Error>,
+        parse_entry: impl Fn(Value) -> Result<Option<T>, Error>,
     ) -> Result<Self, Error> {
         let table = match value {
-            Value::Nil => return Ok(Self::None),
-            Value::String(s) if lua_string(&s, context)?.as_ref() == "all" => return Ok(Self::All),
+            Value::String(s) => {
+                if lua_string(&s, context)?.as_ref() == "all" {
+                    return Ok(Self::All);
+                }
+                return Err(Error::Message(format!("{context} must be a list or 'all'")));
+            }
             Value::Table(t) => t,
-            _ => return Err(Error::Message(format!("{context} must be a list or 'all'"))),
+            _ => return Ok(Self::None),
         };
 
         let mut entries = Vec::new();
         let mut last = 0;
+        let mut count = 0_usize;
         for pair in table.pairs::<Value, Value>() {
             let (idx, value) = pair?;
             let idx = match idx {
@@ -182,9 +164,12 @@ impl<T> AllowList<T> {
             };
             let idx = idx.ok_or_else(|| invalid_list(context))?;
             last = last.max(idx);
-            entries.push(parse_entry(value)?);
+            count = count.checked_add(1).ok_or_else(|| invalid_list(context))?;
+            if let Some(entry) = parse_entry(value)? {
+                entries.push(entry);
+            }
         }
-        if last != entries.len() {
+        if last != count {
             return Err(invalid_list(context));
         }
 
@@ -218,21 +203,33 @@ struct TcpEndpoint {
 }
 
 impl TcpEndpoint {
-    fn parse(value: Value) -> Result<Self, Error> {
+    fn parse(value: Value) -> Result<Option<Self>, Error> {
         let Value::Table(t) = value else {
             return Err(Error::Message("TCP policy entry must be a table".into()));
         };
-        fields(
-            &t,
-            &["client_port", "host_addr", "host_port"],
-            "TCP policy entry",
-        )?;
+        let client_port = t.raw_get("client_port")?;
+        let host_addr = t.raw_get("host_addr")?;
+        let host_port = t.raw_get("host_port")?;
+        if client_port == Value::Nil {
+            return Err(invalid_port("client_port", 0..=u16::MAX));
+        }
+        if host_addr == Value::Nil {
+            return Err(Error::Message("TCP policy entry requires host_addr".into()));
+        }
+        if host_port == Value::Nil {
+            return Err(invalid_port("host_port", 1..=u16::MAX));
+        }
+        let (Value::Integer(client_port), Value::String(host_addr), Value::Integer(host_port)) =
+            (client_port, host_addr, host_port)
+        else {
+            return Ok(None);
+        };
 
-        Ok(Self {
-            client_port: port(&t, "client_port", 0..=u16::MAX)?,
-            host_addr: text(&t, "host_addr")?,
-            host_port: port(&t, "host_port", 1..=u16::MAX)?,
-        })
+        Ok(Some(Self {
+            client_port: port(client_port, "client_port", 0..=u16::MAX)?,
+            host_addr: lua_string(&host_addr, "host_addr")?.to_string(),
+            host_port: port(host_port, "host_port", 1..=u16::MAX)?,
+        }))
     }
 }
 
@@ -243,17 +240,22 @@ struct SocketEndpoint {
 }
 
 impl SocketEndpoint {
-    fn parse(value: Value) -> Result<Self, Error> {
+    fn parse(value: Value) -> Result<Option<Self>, Error> {
         let Value::Table(t) = value else {
             return Err(Error::Message("Socket policy entry must be a table".into()));
         };
-        fields(
-            &t,
-            &["client_socket_path", "host_socket_path"],
-            "socket policy entry",
-        )?;
-        let client_socket_path = text(&t, "client_socket_path")?;
-        let host_socket_path = text(&t, "host_socket_path")?;
+        let client = t.raw_get("client_socket_path")?;
+        let host = t.raw_get("host_socket_path")?;
+        if client == Value::Nil || host == Value::Nil {
+            return Err(Error::Message(
+                "Socket policy entry requires client_socket_path and host_socket_path".into(),
+            ));
+        }
+        let (Value::String(client), Value::String(host)) = (client, host) else {
+            return Ok(None);
+        };
+        let client_socket_path = lua_string(&client, "client_socket_path")?.to_string();
+        let host_socket_path = lua_string(&host, "host_socket_path")?.to_string();
         if client_socket_path.is_empty() || client_socket_path.starts_with('/') {
             return Err(Error::Message("Socket policy client_socket_path must be relative to the process temporary directory".into()));
         }
@@ -263,51 +265,30 @@ impl SocketEndpoint {
             ));
         }
 
-        Ok(Self {
+        Ok(Some(Self {
             client_socket_path,
             host_socket_path,
-        })
+        }))
     }
 }
 
-fn section(t: &Table, key: &str, accepted: &[&str], context: &str) -> Result<Option<Table>, Error> {
-    match t.raw_get(key)? {
-        Value::Nil => Ok(None),
-        Value::Table(t) => {
-            fields(&t, accepted, context)?;
-            Ok(Some(t))
-        }
-        _ => Err(Error::Message(format!("{context} must be a table"))),
-    }
+fn flag(t: &Table, key: &str) -> Result<bool, Error> {
+    Ok(matches!(t.raw_get(key)?, Value::Boolean(true)))
 }
 
-fn flag(t: &Table, key: &str, context: &str) -> Result<bool, Error> {
-    match t.raw_get(key)? {
-        Value::Nil => Ok(false),
-        Value::Boolean(b) => Ok(b),
-        _ => Err(Error::Message(format!("{context} must be a Boolean"))),
-    }
+fn port(value: i64, key: &str, range: RangeInclusive<u16>) -> Result<u16, Error> {
+    u16::try_from(value)
+        .ok()
+        .filter(|n| range.contains(n))
+        .ok_or_else(|| invalid_port(key, range))
 }
 
-fn port(t: &Table, key: &str, range: RangeInclusive<u16>) -> Result<u16, Error> {
-    if let Value::Integer(n) = t.raw_get(key)?
-        && let Ok(n) = u16::try_from(n)
-        && range.contains(&n)
-    {
-        return Ok(n);
-    }
-    Err(Error::Message(format!(
+fn invalid_port(key: &str, range: RangeInclusive<u16>) -> Error {
+    Error::Message(format!(
         "TCP policy {key} must be an integer from {} to {}",
         range.start(),
         range.end()
-    )))
-}
-
-fn text(t: &Table, key: &str) -> Result<String, Error> {
-    match t.raw_get(key)? {
-        Value::String(s) => Ok(lua_string(&s, key)?.to_string()),
-        _ => Err(Error::Message(format!("Policy {key} must be a string"))),
-    }
+    ))
 }
 
 fn parse_origin(value: Value) -> Result<Url, Error> {
@@ -418,6 +399,34 @@ mod tests {
         ] {
             assert_eq!(policy.allows_socket(Path::new(client), host), allowed);
         }
+    }
+
+    #[test]
+    fn omits_unsupported_policy_fields_without_dropping_other_permissions() {
+        let policy = policies(
+            r#"return {plugin={
+            clipboard={copy=0},
+            filesystem={copy=true,future=true},
+            http=false,
+            local_forward={
+                tcp={
+                    {client_port='0',host_addr='ignored',host_port=80},
+                    {client_port=0,host_addr='kept',host_port=80,future=true},
+                },
+                socket={
+                    {client_socket_path=false,host_socket_path='/ignored.sock'},
+                    {client_socket_path='kept.sock',host_socket_path='/kept.sock'},
+                },
+            },
+        }}"#,
+        );
+        assert!(!policy.clipboard_copy);
+        assert!(!policy.http_serve_file);
+        assert!(policy.filesystem_copy);
+        assert!(policy.allows_tcp(0, "kept", 80));
+        assert!(!policy.allows_tcp(0, "ignored", 80));
+        assert!(policy.allows_socket(Path::new("kept.sock"), "/kept.sock"));
+        assert!(!policy.allows_socket(Path::new("ignored.sock"), "/ignored.sock"));
     }
 
     #[test]

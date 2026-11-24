@@ -22,7 +22,7 @@ pub(crate) enum Destination<'a> {
     Default,
     Local(&'a str),
     #[cfg(feature = "ssh")]
-    Ssh(&'a str),
+    Ssh(Option<&'a str>),
 }
 
 pub(crate) fn file_name(
@@ -41,7 +41,9 @@ pub(crate) fn file_name(
         Destination::Default => ("default", ""),
         Destination::Local(alias) => ("local", alias),
         #[cfg(feature = "ssh")]
-        Destination::Ssh(alias) => ("ssh", alias),
+        Destination::Ssh(Some(alias)) => ("ssh", alias),
+        #[cfg(feature = "ssh")]
+        Destination::Ssh(None) => ("default-ssh", ""),
     };
     let identity = [host_name, user, kind, alias]
         .into_iter()
@@ -99,7 +101,7 @@ pub(crate) fn check_local_path_length(path: &Path, alias: Option<&str>) -> Resul
             "The Neovim socket path for host {alias:?} is too long ({len} bytes, maximum {MAX_PATH_LEN} on {os}). Set hosts[{alias:?}].socket to a shorter path.\n{path}"
         ),
         None => format!(
-            "The Neovim socket path is too long ({len} bytes, maximum {MAX_PATH_LEN} on {os}).\n{path}"
+            "The Neovim socket path is too long ({len} bytes, maximum {MAX_PATH_LEN} on {os}). Set default_host.socket to a shorter path.\n{path}"
         ),
     }))
 }
@@ -155,7 +157,7 @@ mod tests {
         );
         #[cfg(feature = "ssh")]
         assert_ne!(
-            file_name(Some(&client), Destination::Ssh("work")).unwrap(),
+            file_name(Some(&client), Destination::Ssh(Some("work"))).unwrap(),
             name
         );
 

@@ -39,6 +39,7 @@ fn evaluates_client_information_defaults_and_ordered_configuration() {
     let config = evaluate(
         r#"
         local client = require("nauvim-client-info")
+        assert(client.ui_id == "org.example.nauvim.test")
         assert(client.host_name == "client.example")
         assert(client.user == "tester")
         assert(client.config_file == "/tmp/nauvim-tests/config.lua")
@@ -155,13 +156,18 @@ fn loads_default_init_in_an_isolated_process() {
     const CHILD: &str = "NAUVIM_TEST_DEFAULT_INIT_CHILD";
     if env::var(CHILD).as_deref() == Ok("1") {
         let config = Config::load(None, UI_ID, |_| Ok(())).unwrap().0;
+        assert_eq!(config.startup_host(), Some(HostSelection::Default));
+        assert!(config.diagnostics().is_empty());
+
+        let root = Path::new(&env::var_os("XDG_CONFIG_HOME").unwrap()).join("nauvim");
+        fs::write(root.join("init.lua"), "return require('settings.hosts')").unwrap();
+        let config = Config::load(None, UI_ID, |_| Ok(())).unwrap().0;
         assert_eq!(config.default_host(), Some("default-init"));
         return;
     }
     let dir = tempdir().unwrap();
     let root = dir.path().join("nauvim");
     fs::create_dir_all(root.join("lua/settings")).unwrap();
-    fs::write(root.join("init.lua"), "return require('settings.hosts')").unwrap();
     fs::write(
         root.join("lua/settings/hosts.lua"),
         "return {default_host = 'default-init', hosts = {['default-init'] = {}}}",
@@ -239,20 +245,7 @@ fn rejects_missing_files_and_invalid_configurations() {
     assert!(config.hosts().next().is_none());
     assert_eq!(config.startup_host(), Some(HostSelection::Default));
     assert_eq!(config.diagnostics().len(), 1);
-    for src in [
-        "return nil",
-        "return {hosts = {a = {default = true}, b = {default = true}}}",
-        "return {['default-host'] = 'a'}",
-        "return {hosts = {a = {['nvim-bin'] = 'nvim'}}}",
-        "return {hosts = {a = {nvim = false}}}",
-        "return {hosts = {a = {socket = 42}}}",
-        "return {hosts = {a = {args = {'-O3'}}}}",
-        "return {hosts = {a = {config = 'NONE'}}}",
-        "return {hosts = {a = {policies = {['local-forward'] = false}}}}",
-        "return {fonts = {{size = 0}}}",
-        "return {default_host = ''}",
-        "return {default_host = 42}",
-    ] {
+    for src in ["return nil", "return {default_host = ''}"] {
         assert!(evaluate(src).is_err(), "configuration was accepted: {src}");
     }
     let mut missing = info(Path::new("/tmp/config.lua"));
@@ -266,22 +259,36 @@ fn rejects_missing_files_and_invalid_configurations() {
     );
 }
 
+#[test]
+fn recovers_unsupported_configuration_keys_and_types() {
+    let src = r#"return {
+        default_host = 42, ['default-host'] = "unused", [false] = true, unknown = true,
+        clipboard = {backend = false, timeout_ms = 25},
+        hosts = {
+            ignored = false, [23] = {},
+            kept = {['nvim-bin'] = 'other',socket = 42,nvim = false,policies={['local-forward']=true}},
+        },
+        ssh = {config=false, known_hosts='/absolute', unknown='ignored'},
+    }"#;
+    let config = evaluate(src).unwrap();
+    assert_eq!(config.default_host(), None);
+    assert_eq!(config.startup_host(), None);
+    assert_eq!(config.hosts().collect::<Vec<_>>(), ["kept"]);
+    assert_eq!(config.clipboard().backend(), "auto");
+    assert_eq!(config.clipboard().timeout().as_millis(), 25);
+}
+
 #[cfg(feature = "ssh")]
 #[test]
 fn validates_unused_native_ssh_tables_and_inline_jump_hosts() {
     for field in [
-        "unknown = true",
-        "request_tty = true",
-        "host_name = false",
         "port = -1",
         "port = 65536",
         "port = '2.5'",
         "identity_file = 'relative'",
-        "identity_file = {'/absolute', 'relative'}",
         "identity_agent = 'none'",
         "certificate_file = ''",
         "identities_only = 'sometimes'",
-        "proxy_jump = {{host_name = 'jump', unknown = true}}",
         "proxy_jump = {{host_name = 'jump', identity_file = 'relative'}}",
     ] {
         let src = format!("return {{hosts = {{unused = {{ssh = {{{field}}}}}}}}}");
@@ -289,6 +296,16 @@ fn validates_unused_native_ssh_tables_and_inline_jump_hosts() {
             evaluate(&src).is_err(),
             "native SSH setting accepted: {field}"
         );
+    }
+    for field in [
+        "unknown = true",
+        "request_tty = true",
+        "host_name = false",
+        "identity_file = {'/absolute', 'relative'}",
+        "proxy_jump = {{host_name = 'jump', unknown = true}}",
+    ] {
+        let src = format!("return {{hosts = {{unused = {{ssh = {{{field}}}}}}}}}");
+        assert!(evaluate(&src).is_ok(), "{field}");
     }
     for value in ["true", "false", "'yes'", "'NO'", "'True'", "'FALSE'"] {
         let src = format!(
@@ -383,7 +400,7 @@ fn falls_back_to_complete_defaults_after_read_execution_or_validation_failure() 
         "return {",
         "error('broken setup')",
         "return {default_host=''}",
-        "return {hosts={custom={}},ui_opts={unused={value=function() end}}}",
+        "return {hosts={custom={}},ui_opts={unused={value={function() end}}}}",
     ] {
         fs::write(&file, src).unwrap();
         let config = Config::load(Some(&file), UI_ID, |_| Ok(())).unwrap().0;
@@ -398,7 +415,7 @@ fn falls_back_to_complete_defaults_after_read_execution_or_validation_failure() 
 #[test]
 fn validates_global_ssh_paths_without_accessing_them() {
     for field in ["config", "known_hosts"] {
-        for value in ["''", "'relative/config'", "42", "false"] {
+        for value in ["''", "'relative/config'"] {
             assert!(evaluate(&format!("return {{ssh={{{field}={value}}}}}")).is_err());
         }
         assert!(
@@ -414,45 +431,8 @@ fn validates_global_ssh_paths_without_accessing_them() {
 fn validates_plugin_policies_for_unselected_hosts() {
     for (policy, diagnostic) in [
         (
-            "{local_forward=true}",
-            "Unknown policies field: local_forward",
-        ),
-        ("{plugin=false}", "policies.plugin must be a table"),
-        (
-            "{plugin={[1]=true}}",
-            "policies.plugin field names must be strings",
-        ),
-        (
-            "{plugin={clipboard='yes'}}",
-            "plugin.clipboard must be a table",
-        ),
-        (
-            "{plugin={clipboard={copy=0}}}",
-            "plugin.clipboard.copy must be a Boolean",
-        ),
-        (
-            "{plugin={filesystem={copy='yes'}}}",
-            "plugin.filesystem.copy must be a Boolean",
-        ),
-        (
-            "{plugin={http={serve_file={}}}}",
-            "plugin.http.serve_file must be a Boolean",
-        ),
-        (
-            "{plugin={http={open_webview={served_files='yes'}}}}",
-            "served_files must be a Boolean",
-        ),
-        (
-            "{plugin={http={open_webview={extra=true}}}}",
-            "Unknown plugin.http.open_webview field: extra",
-        ),
-        (
             "{plugin={local_forward={tcp='any'}}}",
             "plugin.local_forward.tcp must be a list",
-        ),
-        (
-            "{plugin={local_forward={socket=false}}}",
-            "plugin.local_forward.socket must be a list",
         ),
         (
             "{plugin={local_forward={tcp={{host_addr='example.test',host_port=80}}}}}",
@@ -460,10 +440,6 @@ fn validates_plugin_policies_for_unselected_hosts() {
         ),
         (
             "{plugin={local_forward={tcp={{client_port=65536,host_addr='example.test',host_port=80}}}}}",
-            "client_port must be an integer",
-        ),
-        (
-            "{plugin={local_forward={tcp={{client_port='0',host_addr='example.test',host_port=80}}}}}",
             "client_port must be an integer",
         ),
         (
@@ -585,22 +561,8 @@ fn selects_exact_ui_key_without_merging_dictionaries() {
 #[test]
 fn validates_ui_values_in_unselected_dictionaries() {
     for invalid in [
-        "false",
-        "'string'",
-        "42",
-        "function() end",
-        "{[1]='not a string key'}",
-        "{handler=function() end}",
-        "{nested={handler=function() end}}",
-        "{nested={[function() end]=true}}",
-        "{nested={[{handler=function() end}]=true}}",
         "{nested={{{function() end}}}}",
-        "{nested=coroutine.create(function() end)}",
-        "{nested=io.stdout}",
-        "{nested={[false]=true}}",
-        "{nested={[1.5]=true}}",
         "{nested={true,[3]=false}}",
-        "{nested={true,name=false}}",
         r"{nested={['\255']=true}}",
         r"{nested={['\239\187\191key']=true}}",
         r"{nested={['key\0']=true}}",
@@ -620,8 +582,22 @@ fn validates_ui_values_in_unselected_dictionaries() {
             "unexpected error for {invalid}: {error}"
         );
     }
-    assert!(ui_options("return {ui_opts=false}").is_err());
-    assert!(ui_options("return {ui_opts={[1]={}}}").is_err());
+    assert!(
+        ui_options("return {ui_opts=false}")
+            .unwrap()
+            .root()
+            .entries()
+            .len()
+            == 0
+    );
+    assert!(
+        ui_options("return {ui_opts={[1]={}}}")
+            .unwrap()
+            .root()
+            .entries()
+            .len()
+            == 0
+    );
 }
 
 #[test]
@@ -631,8 +607,6 @@ fn validates_ui_mapping_keys_selectors_and_implementation_ids() {
         "'\\239\\187\\191leading'",
         "'nul\\0inside'",
         "'\\255'",
-        "false",
-        "42",
     ] {
         let src = format!("return {{use_ui_opts={value}}}");
         assert!(ui_options(&src).is_err(), "selector accepted: {value}");
@@ -674,9 +648,39 @@ fn validates_ui_mapping_keys_selectors_and_implementation_ids() {
 }
 
 #[test]
+fn recovers_ui_dictionary_entries_before_delivering_the_selected_options() {
+    let opts = ui_options(
+        r#"local client = require("nauvim-client-info")
+        assert(client.ui_id == "org.example.nauvim.test")
+        return {
+            use_ui_opts = false,
+            ui_opts = {
+                unused = 42,
+                [1] = {},
+                [client.ui_id] = {
+                    handler = function() end,
+                    [2] = "discard",
+                    nested = {{ [false] = true, keep = "kept", extra = io.stdout }},
+                },
+            },
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(opts.get("handler"), None);
+    let list = opts.table(table_id(opts.get("nested"))).unwrap();
+    let nested = opts
+        .table(table_id(list.entries().next().map(|(_, v)| v)))
+        .unwrap();
+    assert_eq!(nested.get("keep"), Some(&UiValue::String("kept".into())));
+    assert_eq!(nested.entries().len(), 1);
+}
+
+#[test]
 fn delivers_nested_ui_lists_and_string_keyed_dictionaries() {
     let opts = ui_options(
-        r#"return {
+        r#"local client = require("nauvim-client-info")
+            assert(client.ui_id == "org.example.nauvim.test")
+            return {
             ui_opts={['org.example.nauvim.test']={
                 ['kebab-key']=-3,
                 ['']='',
@@ -779,7 +783,7 @@ fn interprets_only_selected_ui_schema_after_all_core_validation() {
     assert!(matches!(error, Error::UiOptions(_)));
     for invalid in [
         "return {ssh={config='relative'},ui_opts={}}",
-        "return {ui_opts={unused={f=function() end}}}",
+        "return {ui_opts={unused={f={function() end}}}}",
     ] {
         let mut called = false;
         let result = Config::evaluate(
@@ -834,7 +838,7 @@ fn passes_only_empty_defaults_to_parser_after_common_validation_failure() {
     let file = dir.path().join("init.lua");
     fs::write(
         &file,
-        "return {hosts={custom={}},ui_opts={unused={f=function() end}}}",
+        "return {hosts={custom={}},ui_opts={unused={f={function() end}}}}",
     )
     .unwrap();
     let mut calls = 0;
@@ -848,7 +852,7 @@ fn passes_only_empty_defaults_to_parser_after_common_validation_failure() {
     assert_eq!(config.startup_host(), Some(HostSelection::Default));
     assert!(config.hosts().next().is_none());
     assert_eq!(config.diagnostics().len(), 1);
-    assert!(config.diagnostics()[0].contains("Unsupported UI option value type: function"));
+    assert!(config.diagnostics()[0].contains("Unsupported UI option list element type: function"));
 }
 
 #[test]

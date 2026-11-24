@@ -9,17 +9,27 @@ integration, see the [frontend implementor guide](implementors.md).
 The frontend passes an optional path, its UI implementation ID, and its UI-option
 parser to `Config::load()`. The default path is
 `$XDG_CONFIG_HOME/nauvim/init.lua`, using the platform configuration directory
-when `XDG_CONFIG_HOME` is unset. The engine evaluates the file using vendored
-Lua 5.4 in the client environment.
+when `XDG_CONFIG_HOME` is unset. If the implicit file is absent, startup uses
+the defaults without a loading diagnostic. A missing explicit path is a
+loading failure. The engine evaluates the file using vendored Lua 5.4 in the
+client environment.
 
-Before execution, the engine acquires complete client `HostInfo` and installs
-`require("nauvim-client-info")`. Its path fields are absolute with symbolic links
-resolved. Its non-nil `config_file` identifies the selected configuration file.
+Before execution, the engine makes `ClientInfo` available through
+`require("nauvim-client-info")`. It contains the client environment’s
+`HostInfo` fields and `ui_id`, the frontend’s supplied implementation ID.
+Its path fields are absolute with symbolic links resolved. Its non-nil
+`config_file` identifies the selected configuration file.
 The engine prepends `ROOT/lua/?.lua;ROOT/lua/?/init.lua` to `package.path`, where
 `ROOT` is that resolved file's parent directory. Existing entries follow these
 templates. Neovim runtime directories are not added.
 
-A read, execution, information-acquisition, or validation failure selects the
+Unknown dictionary keys and values of unsupported types are treated as omitted.
+This applies to nested dictionaries, including those in lists. When recovery
+removes a required field with no default from a nested dictionary, validation
+drops that dictionary. Values of supported types still need to satisfy their
+range, string, path, and other content restrictions.
+
+Other read, execution, information-acquisition, or validation failures select the
 complete default configuration, including an empty UI-option dictionary. This
 includes failures from the frontend's selected-option parser.
 `Config::diagnostics()` retains the error; `Engine::next_event()` emits it as
@@ -60,10 +70,11 @@ Required source errors fail the connection attempt.
 
 ## Host plugin permissions
 
-Set permissions for each host under `hosts[alias].policies.plugin`. Omitted, nil,
-and empty policies grant no permissions. This includes the default local host
-and destinations resolved only through OpenSSH. Configuration loading validates
-the permissions for every configured host.
+Set permissions for each host under `hosts[alias].policies.plugin` or
+`default_host.policies.plugin` for the independent default host. Omitted, nil,
+and empty policies grant no permissions. Destinations resolved solely through
+OpenSSH also grant no permissions. Configuration loading validates permissions
+for every configured host.
 
 ```lua
 policies = {
@@ -107,24 +118,22 @@ GUI paste follow their ordinary rules.
 
 ## Selecting a startup host
 
-`default_host` is a top-level non-empty string or nil. The default is nil. An
-omitted, nil, or empty `hosts` table is an empty host collection.
+`default_host` accepts a non-empty alias string, a host configuration table, or
+nil. The default is nil. An omitted, nil, or empty `hosts` table is an empty host
+collection.
 
 | Configuration | Startup action |
 | --- | --- |
-| Empty `hosts`, nil `default_host` | Connect to the default local Host. |
-| Non-empty `hosts`, nil `default_host` | Show the welcome page. |
-| Non-empty `default_host` | Connect to that alias. |
+| Empty `hosts`, table or nil `default_host` | Connect to the independent default host. |
+| Non-empty `hosts`, table or nil `default_host` | Show the welcome page with the named hosts and the independent default host. |
+| Alias string in `default_host` | Connect to that alias. |
 
-A configured alias without `ssh` selects a local host. A configured alias with
-`ssh`, or an alias absent from `hosts`, uses SSH resolution. SSH destinations
-cannot connect when the `ssh` feature is excluded.
-
-The default Host is an independent local choice using the default program and
-socket settings. It is separate from every named entry, including entries named
-`"local"` or `"default"`. A welcome page should offer that choice together with
-`Config::hosts()`. Use `Engine::connect_default()` for it and `Engine::connect()`
-for a named alias. `Config::startup_host()` exposes automatic startup selection.
+A `default_host` table configures the independent choice using the same fields
+as a named host. With nil or an alias string, the independent choice uses the
+built-in local configuration. Entries named `"local"` and `"default"` remain
+available as ordinary aliases. A configured host without `ssh` is local. A
+configured host with `ssh`, or an alias absent from `hosts`, uses SSH
+resolution. SSH destinations require the `ssh` feature.
 
 Call `Engine::start()` once with the current UI dimensions to apply this startup
 selection. Detachment and recovery return to the welcome page without repeating
@@ -204,9 +213,9 @@ both defaults. Supplied paths must be non-empty absolute paths.
 
 A host's native `ssh` table accepts `host_name`, `user`, `port`, `identity_file`,
 `certificate_file`, `identity_agent`, `identities_only`, `proxy_jump`,
-`kex_algorithms`, and `host_key_algorithms`. Unknown fields and invalid types
-are rejected during configuration loading, including in unused hosts and inline
-jump tables. Native host names match exactly; `*`, `?`, and `!` are literal.
+`kex_algorithms`, and `host_key_algorithms`. The configuration recovery rules
+apply to named hosts, the independent default host, and inline jump hosts.
+Native host names match exactly. The characters `*`, `?`, and `!` are literal.
 
 Identity, certificate, and agent values are single absolute path strings. Native
 paths receive no tilde or environment expansion. No agent is inferred from
@@ -214,7 +223,9 @@ paths receive no tilde or environment expansion. No agent is inferred from
 `true`, `false`, `yes`, and `no` strings; it does not disable an explicit agent.
 
 Resolution gives precedence to the requested native table. Its `host_name`, or
-the requested alias when omitted, supplies a lookup name. One direct lookup of
+the requested alias when omitted, supplies a lookup name. The independent
+default host has no alias and requires `default_host.ssh.host_name` for SSH.
+One direct lookup of
 that name's native SSH table fills absent fields. If fields remain absent, the
 selected OpenSSH source supplies further settings. Native defaults apply last.
 The native merge is shallow: a supplied false, zero, or empty jump sequence
@@ -294,16 +305,19 @@ Every outer mapping key, non-nil selector, and supplied implementation ID must
 be non-empty valid UTF-8, must not begin with U+FEFF, and must not contain NUL.
 Every non-nil entry must be a dictionary with string keys. Values may be nil,
 booleans, integers, floating-point numbers, strings, lists, or string-keyed
-dictionaries. Nested Lua lists use contiguous integer keys starting at `1`.
-Core rejects cyclic tables and values such as functions, threads, and userdata.
+dictionaries. Nested tables with string keys are dictionaries. Nested tables
+with integer keys and no string keys are lists and need contiguous indices
+starting at `1`. Core treats functions, threads, and userdata as omitted in dictionaries. It
+rejects these types as list elements and rejects cyclic tables.
 All string keys and values must be valid UTF-8 without NUL or an initial U+FEFF.
 Inner strings may be empty and may contain U+FEFF after the first character.
 Core checks these requirements for all entries, including unselected entries.
 
 Dictionary field names may use any valid string. The frontend validates the
-selected dictionary against its own schema. A common or selected-schema failure during
-file loading selects the complete default configuration and produces a
-diagnostic as described under [loading configuration](#loading-configuration).
+selected dictionary against its own schema and applies the dictionary recovery
+rules. Remaining failures during file loading select the complete default
+configuration and produce a diagnostic as described under
+[loading configuration](#loading-configuration).
 
 ## Events and cleanup
 

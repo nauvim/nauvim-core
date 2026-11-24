@@ -30,6 +30,10 @@ pub struct HostInfo {
 impl HostInfo {
     /// Acquires local information; `config_file` distinguishes the client role.
     pub fn local(config_file: Option<&Path>) -> Result<Self, Error> {
+        Self::local_with_config(config_file.map(fs::canonicalize).transpose()?)
+    }
+
+    pub(super) fn local_with_config(config_file: Option<PathBuf>) -> Result<Self, Error> {
         use directories::BaseDirs;
 
         let dirs = BaseDirs::new()
@@ -53,7 +57,7 @@ impl HostInfo {
         Ok(Self {
             host_name,
             user,
-            config_file: config_file.map(fs::canonicalize).transpose()?,
+            config_file,
             home_dir: resolve_path(dirs.home_dir())?,
             project_dirs: ProjectDirs {
                 cache_dir: resolve_path(&cache.join("nauvim"))?,

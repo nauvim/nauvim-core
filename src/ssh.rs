@@ -53,7 +53,7 @@ impl MakeHandler for Handlers<'_> {
 
 pub(crate) async fn open(
     config: &Config,
-    alias: &str,
+    alias: Option<&str>,
     reuse_only: bool,
 ) -> Result<(Transport, Remote), Error> {
     let Resolved { chain, preferences } = resolve_host(config, alias)?;
@@ -84,13 +84,13 @@ pub(crate) async fn open(
 
 async fn open_on(
     config: &Config,
-    alias: &str,
+    alias: Option<&str>,
     conn: &Remote,
     reuse_only: bool,
 ) -> Result<Transport, Error> {
     use crate::socket::{self, DIR_PREFIX, Destination};
 
-    let host = config.hosts.get(alias);
+    let host = config.host(alias);
     let configured_socket = host.and_then(|h| h.socket.as_ref());
     let needs_info = host.is_some_and(|h| h.nvim.needs_info())
         || configured_socket.is_some_and(|s| s.needs_info());
@@ -117,8 +117,12 @@ async fn open_on(
         return Ok(Transport::remote(stream));
     }
     if reuse_only {
+        let destination = alias.map_or_else(
+            || "the default host".to_owned(),
+            |alias| format!("{alias:?}"),
+        );
         return Err(Error::Message(format!(
-            "Reattach to Neovim on {alias:?} at {socket}: no running session"
+            "Reattach to Neovim on {destination} at {socket}: no running session"
         )));
     }
     // A detached shell job has no inherited channel I/O and survives SSH closure.
