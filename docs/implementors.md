@@ -730,6 +730,6 @@ The core's own tests validate engine behaviour, not your toolkit adapter.
 See [development and validation](development.md) for those checks and the
 requirements of the optional live integration suites.
 
-[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.1.0/specification.md
+[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.2.0/specification.md
 [ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.3/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/

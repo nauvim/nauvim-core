@@ -17,6 +17,8 @@ client environment.
 Before execution, the engine makes `ClientInfo` available through
 `require("nauvim-client-info")`. It contains the client environment’s
 `HostInfo` fields and `ui_id`, the frontend’s supplied implementation ID.
+Its `os`, `os_family`, and `arch` fields contain the Rust target values for
+the client operating system, operating system family, and CPU architecture.
 Its path fields are absolute with symbolic links resolved. Its non-nil
 `config_file` identifies the selected configuration file.
 The engine prepends `ROOT/lua/?.lua;ROOT/lua/?/init.lua` to `package.path`, where

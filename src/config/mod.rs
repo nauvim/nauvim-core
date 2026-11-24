@@ -5,6 +5,7 @@ use mlua::{BorrowedStr, Function, Lua, Table, Value};
 use directories::BaseDirs;
 
 use std::collections::BTreeMap;
+use std::env::consts;
 use std::path::{Path, PathBuf};
 
 mod info;
@@ -270,6 +271,9 @@ impl Config {
         let loaded: Table = package.get("loaded")?;
         let client = info.table(&lua)?;
         client.set("ui_id", ui_id)?;
+        client.set("os", consts::OS)?;
+        client.set("os_family", consts::FAMILY)?;
+        client.set("arch", consts::ARCH)?;
         loaded.set("nauvim-client-info", client)?;
         let t: Table = lua.load(src).set_name(file.to_string_lossy()).eval()?;
 

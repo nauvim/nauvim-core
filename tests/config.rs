@@ -66,6 +66,26 @@ fn evaluates_client_information_defaults_and_ordered_configuration() {
 }
 
 #[test]
+fn exposes_client_platform_during_configuration() {
+    use std::env::consts;
+
+    let src = format!(
+        r#"
+        local client = require("nauvim-client-info")
+        assert(client.os == {})
+        assert(client.os_family == {})
+        assert(client.arch == {})
+        return {{}}
+        "#,
+        lua_quote(consts::OS),
+        lua_quote(consts::FAMILY),
+        lua_quote(consts::ARCH),
+    );
+
+    evaluate(&src).unwrap();
+}
+
+#[test]
 fn retains_function_settings_without_evaluating_unused_hosts() {
     let config = evaluate(
         r#"
