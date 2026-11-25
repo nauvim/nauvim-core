@@ -20,6 +20,7 @@ the rendering model and input types re-exported by `nauvim-core`.
 - [Engine events and session transitions](#engine-events-and-session-transitions)
 - [Rendering frames](#rendering-frames)
 - [Keyboard, mouse, and focus](#keyboard-mouse-and-focus)
+- [Input method editors](#input-method-editors)
 - [Clipboard and GUI paste](#clipboard-and-gui-paste)
 - [Plugin windows and client resources](#plugin-windows-and-client-resources)
 - [Errors, detachment, and shutdown](#errors-detachment-and-shutdown)
@@ -474,9 +475,31 @@ grid and include only that grid's text. These interaction rules also apply to
 plugin-created GUI windows.
 
 Report application focus changes through `Client::focus()`. It returns after
-writing the notification, without waiting for editor execution. Native IME
-integration is outside the specification's current scope; host plugins can
-provide input methods.
+writing the notification, without waiting for editor execution.
+
+## Input method editors
+
+Native IME integration is outside the Nauvim specification. In `nauvim`, the
+application handles native input methods, including preedit display,
+composition cancellation, and candidate placement. `nauvim-core` supplies the
+Neovim cursor and text input APIs independently of IME software, protocols,
+and operating systems.
+
+Use `ime::anchor(&frame.state)` with the frame you present to locate the editor's
+text cursor. It selects the innermost external command line when one is active
+and otherwise returns the grid cursor if available. Map the anchor through your
+layout. A grid cursor uses grid-local cells. For a command line, map the UTF-8
+byte offset in the content after accounting for any displayed prefix. Use
+`frame.state.mode.name` if your application enables composition in selected
+Neovim modes. Cursor and mode updates come from the [Neovim UI protocol][ui-protocol].
+
+Keep preedit text in the application until the input method commits it. Send
+committed keyboard text with `Client::send_key(KeyInput::Text { text })` on the
+attachment that owns the composition. This uses `nvim_input()` with literal
+`<` escaped and preserves Neovim's normal keyboard input processing. For text
+blocks, `Client::paste(text)` calls `nvim_paste()` directly with the supplied
+text and reports whether Neovim's paste handler accepted it. See the
+[Neovim API reference][nvim-api].
 
 ## Clipboard and GUI paste
 
@@ -733,3 +756,4 @@ requirements of the optional live integration suites.
 [spec]: https://github.com/nauvim/nauvim-spec/blob/v1.2.0/specification.md
 [ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.3/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/
+[nvim-api]: https://neovim.io/doc/user/api/

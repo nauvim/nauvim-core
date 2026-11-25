@@ -50,6 +50,7 @@ mod engine;
 pub use engine::{Client, Engine, EngineEvent, WebviewPosition};
 mod error;
 pub use error::Error;
+pub mod ime;
 pub mod resources;
 pub use resources::ResourceHandle;
 #[cfg(feature = "plugin-http")]

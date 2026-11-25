@@ -1,4 +1,5 @@
-use nauvim_core::{Client, Config, Engine, EngineEvent};
+use nauvim_core::ime::{self, Anchor};
+use nauvim_core::{Client, Config, Engine, EngineEvent, KeyInput};
 
 mod support;
 use support::checkpoint::{
@@ -314,8 +315,6 @@ async fn sigterm_removes_process_temporary_directory_before_shutdown_event() {
 #[tokio::test]
 #[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
 async fn live_input_registration_detachment_and_persistent_reattachment() {
-    use nauvim_core::KeyInput;
-
     let root = tempdir().unwrap();
     let socket = root.path().join("persistent session.sock");
     let mut engine = Engine::new(config(root.path(), &socket)).unwrap();
@@ -425,6 +424,53 @@ async fn live_input_registration_detachment_and_persistent_reattachment() {
         .unwrap();
     assert_eq!(line, "日本語<Esc>");
     wait_setup(&engine, &client).await;
+    quit(&mut engine).await;
+}
+
+#[tokio::test]
+#[ignore = "requires NVIM_BIN pointing to Neovim v0.12.6 and local Unix sockets"]
+async fn live_ime_anchor_and_committed_command_line_text() {
+    let root = tempdir().unwrap();
+    let socket = root.path().join("ime.sock");
+    let mut engine = Engine::new(config(root.path(), &socket)).unwrap();
+    engine.connect("local_host", 80, 24).await.unwrap();
+    let client = engine.client().unwrap();
+
+    let frame = next_frame(&mut engine).await;
+    assert!(matches!(ime::anchor(&frame.state), Some(Anchor::Grid(_))));
+
+    let text = "日本語<Esc>";
+    client.input(":").await.unwrap();
+    client.send_key(KeyInput::Text { text }).await.unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = next_frame(&mut engine).await;
+            if let Some(Anchor::Cmdline(cmdline)) = ime::anchor(&frame.state)
+                && cmdline.pos == text.len()
+            {
+                let content: String = cmdline.content.iter().map(|c| c.text.as_ref()).collect();
+                assert_eq!(content, text);
+                assert_eq!(&*cmdline.firstc, ":");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("Neovim did not display the committed command-line text");
+
+    client.input("<Esc>").await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let frame = next_frame(&mut engine).await;
+            if matches!(ime::anchor(&frame.state), Some(Anchor::Grid(_))) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("IME anchor did not return to the grid cursor");
+
     quit(&mut engine).await;
 }
 
