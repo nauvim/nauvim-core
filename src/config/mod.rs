@@ -24,6 +24,7 @@ use program::ProgramSetting;
 pub(crate) mod ssh;
 mod ssh_input;
 
+#[derive(Clone)]
 pub(crate) enum Setting {
     Text(String),
     Function(Function),
@@ -70,8 +71,31 @@ pub(crate) struct Host {
     pub remote: bool,
 }
 
-impl Host {
+#[derive(Default)]
+struct HostParams {
+    nvim: Option<ProgramSetting>,
+    socket: Option<Setting>,
+    policies: Option<Policies>,
+}
+
+impl HostParams {
     fn parse(t: &Table) -> Result<Self, Error> {
+        let nvim = ProgramSetting::parse(t.get("nvim")?)?;
+        let socket = Setting::parse(t.get("socket")?, "socket")?;
+        let policies = table(t.raw_get("policies")?)
+            .map(|t| Policies::parse(Some(t)))
+            .transpose()?;
+
+        Ok(Self {
+            nvim,
+            socket,
+            policies,
+        })
+    }
+}
+
+impl Host {
+    fn parse(t: &Table, defaults: &HostParams) -> Result<Self, Error> {
         let ssh = table(t.get("ssh")?);
         if let Some(t) = &ssh {
             #[cfg(feature = "ssh")]
@@ -80,15 +104,26 @@ impl Host {
             ssh_input::validate_strings(t)?;
         }
 
-        Ok(Self {
-            nvim: ProgramSetting::parse(t.get("nvim")?)?.unwrap_or_default(),
-            socket: Setting::parse(t.get("socket")?, "socket")?,
-            policies: Policies::parse(table(t.raw_get("policies")?))?,
+        let params = HostParams::parse(t)?;
+        Ok(Self::configured(params, defaults, ssh))
+    }
+
+    fn configured(params: HostParams, defaults: &HostParams, ssh: Option<Table>) -> Self {
+        Self {
+            nvim: params
+                .nvim
+                .or_else(|| defaults.nvim.clone())
+                .unwrap_or_default(),
+            socket: params.socket.or_else(|| defaults.socket.clone()),
+            policies: params
+                .policies
+                .or_else(|| defaults.policies.clone())
+                .unwrap_or_default(),
             #[cfg(feature = "ssh")]
             ssh,
             #[cfg(not(feature = "ssh"))]
             remote: ssh.is_some(),
-        })
+        }
     }
 
     pub(crate) fn is_remote(&self) -> bool {
@@ -121,10 +156,11 @@ pub struct Config {
     pub(crate) default_spec: Host,
     pub(crate) client: Option<HostInfo>,
     default_host: Option<String>,
+    ime: bool,
     clipboard: ClipboardConfig,
     diagnostics: Vec<String>,
     #[cfg(feature = "ssh")]
-    pub(crate) ssh_config: PathBuf,
+    pub(crate) ssh_config: Option<PathBuf>,
     #[cfg(feature = "ssh")]
     pub(crate) known_hosts: PathBuf,
 }
@@ -141,10 +177,11 @@ impl Default for Config {
             default_spec: Host::default(),
             client: None,
             default_host: None,
+            ime: true,
             clipboard: ClipboardConfig::default(),
             diagnostics: Vec::new(),
             #[cfg(feature = "ssh")]
-            ssh_config: home.join(".ssh/config"),
+            ssh_config: Some(home.join(".ssh/config")),
             #[cfg(feature = "ssh")]
             known_hosts: home.join(".ssh/known_hosts"),
         }
@@ -170,10 +207,28 @@ impl Config {
     pub fn load<T>(
         path: Option<&Path>,
         ui_id: &str,
+        parse_ui_opts: impl FnMut(UiConfig) -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
+        Self::load_with_module_paths(path, ui_id, &[], parse_ui_opts)
+    }
+
+    /// Loads configuration with additional Lua module file name templates.
+    ///
+    /// The templates use Lua's `package.path` syntax, such as
+    /// `/path/to/modules/?.lua`. They are searched in the supplied order after the
+    /// two configuration-relative templates and before Lua's existing search
+    /// path. They are available to `require()` from the first configuration
+    /// statement. A template containing NUL is a configuration-loading error.
+    ///
+    /// File loading, UI option parsing and fallback follow [`Self::load()`].
+    pub fn load_with_module_paths<T>(
+        path: Option<&Path>,
+        ui_id: &str,
+        module_paths: &[&str],
         mut parse_ui_opts: impl FnMut(UiConfig) -> Result<T, Error>,
     ) -> Result<(Self, T), Error> {
         ui_opts::validate_id(ui_id)?;
-        match Self::try_load(path, ui_id, &mut parse_ui_opts) {
+        match Self::try_load(path, ui_id, module_paths, &mut parse_ui_opts) {
             Ok(Some(config)) => Ok(config),
             Ok(None) => {
                 let opts = parse_ui_opts(UiConfig::default())
@@ -199,6 +254,7 @@ impl Config {
     fn try_load<T>(
         path: Option<&Path>,
         ui_id: &str,
+        module_paths: &[&str],
         parse_ui_opts: impl FnOnce(UiConfig) -> Result<T, Error>,
     ) -> Result<Option<(Self, T)>, Error> {
         use std::io::ErrorKind;
@@ -229,7 +285,7 @@ impl Config {
             Err(e) => return Err(e.into()),
         };
         let info = HostInfo::local_with_config(Some(file))?;
-        Self::evaluate(&src, info, ui_id, parse_ui_opts).map(Some)
+        Self::evaluate_with_module_paths(&src, info, ui_id, module_paths, parse_ui_opts).map(Some)
     }
 
     /// Evaluates source and parses its selected UI-specific dictionary.
@@ -248,6 +304,16 @@ impl Config {
         ui_id: &str,
         parse_ui_opts: impl FnOnce(UiConfig) -> Result<T, Error>,
     ) -> Result<(Self, T), Error> {
+        Self::evaluate_with_module_paths(src, info, ui_id, &[], parse_ui_opts)
+    }
+
+    fn evaluate_with_module_paths<T>(
+        src: &str,
+        info: HostInfo,
+        ui_id: &str,
+        module_paths: &[&str],
+        parse_ui_opts: impl FnOnce(UiConfig) -> Result<T, Error>,
+    ) -> Result<(Self, T), Error> {
         ui_opts::validate_id(ui_id)?;
         let info = info.resolved()?;
         let lua = Lua::new();
@@ -259,15 +325,21 @@ impl Config {
             .parent()
             .ok_or_else(|| Error::Message("Configuration path has no parent".into()))?;
         let package: Table = lua.globals().get("package")?;
-        let old: String = package.get("path")?;
-        package.set(
-            "path",
-            format!(
-                "{}/lua/?.lua;{}/lua/?/init.lua;{old}",
-                root.display(),
-                root.display()
-            ),
-        )?;
+        let original: mlua::String = package.get("path")?;
+        let root = root.display();
+        let mut search_path = format!("{root}/lua/?.lua;{root}/lua/?/init.lua;").into_bytes();
+        for template in module_paths {
+            if template.as_bytes().contains(&0) {
+                return Err(Error::Message(
+                    "Lua module search path must not contain NUL".into(),
+                ));
+            }
+            search_path.extend_from_slice(template.as_bytes());
+            search_path.push(b';');
+        }
+        search_path.extend_from_slice(&original.as_bytes());
+        package.set("path", lua.create_string(search_path)?)?;
+
         let loaded: Table = package.get("loaded")?;
         let client = info.table(&lua)?;
         client.set("ui_id", ui_id)?;
@@ -279,6 +351,11 @@ impl Config {
 
         let mut diagnostics = Vec::new();
         let clipboard = ClipboardConfig::parse(t.get("clipboard")?, &mut diagnostics)?;
+        let ime = !matches!(t.get("ime")?, Value::Boolean(false));
+        let shared = table(t.get("hosts_default_params")?)
+            .map(|t| HostParams::parse(&t))
+            .transpose()?
+            .unwrap_or_default();
         let (default_host, default_spec) = match t.get("default_host")? {
             Value::String(s) => {
                 let s = lua_string(&s, "default_host")?;
@@ -287,8 +364,8 @@ impl Config {
                 }
                 (Some(s.to_string()), Host::default())
             }
-            Value::Table(t) => (None, Host::parse(&t)?),
-            _ => (None, Host::default()),
+            Value::Table(t) => (None, Host::parse(&t, &shared)?),
+            _ => (None, Host::configured(HostParams::default(), &shared, None)),
         };
         let mut hosts = BTreeMap::new();
         if let Some(t) = table(t.get("hosts")?) {
@@ -299,17 +376,15 @@ impl Config {
                 };
                 let alias = lua_string(&alias, "Host alias")?;
                 if let Value::Table(h) = value {
-                    hosts.insert(alias.to_string(), Host::parse(&h)?);
+                    hosts.insert(alias.to_string(), Host::parse(&h, &shared)?);
                 }
             }
         }
-        let (_ssh_config, _known_hosts) = if let Some(ssh) = table(t.get("ssh")?) {
-            (
-                global_path(&ssh, "config")?,
-                global_path(&ssh, "known_hosts")?,
-            )
-        } else {
-            (None, None)
+        let ssh = table(t.get("ssh")?);
+        let _ssh_config = global_ssh_config(ssh.as_ref(), &info.home_dir)?;
+        let _known_hosts = match ssh {
+            Some(t) => absolute_path(t.get("known_hosts")?, "ssh.known_hosts")?,
+            None => None,
         };
         let opts = parse_ui_opts(ui_opts::select(&t, ui_id)?)
             .map_err(|e| Error::UiOptions(Box::new(e)))?;
@@ -319,11 +394,12 @@ impl Config {
                 hosts,
                 default_spec,
                 #[cfg(feature = "ssh")]
-                ssh_config: _ssh_config.unwrap_or_else(|| info.home_dir.join(".ssh/config")),
+                ssh_config: _ssh_config,
                 #[cfg(feature = "ssh")]
                 known_hosts: _known_hosts.unwrap_or_else(|| info.home_dir.join(".ssh/known_hosts")),
                 client: Some(info),
                 default_host,
+                ime,
                 clipboard,
                 diagnostics,
             },
@@ -334,6 +410,13 @@ impl Config {
     /// Borrows the client information acquired before configuration execution.
     pub fn client_info(&self) -> Option<&HostInfo> {
         self.client.as_ref()
+    }
+
+    /// Returns whether the configuration selects native text input for the attached editor.
+    ///
+    /// The default is `true`. The frontend controls native input routing and composition.
+    pub fn ime(&self) -> bool {
+        self.ime
     }
 
     /// Borrows the client-side clipboard backend and operation timeout settings.
@@ -383,13 +466,46 @@ fn table(value: Value) -> Option<Table> {
     }
 }
 
-fn global_path(t: &Table, field: &str) -> Result<Option<PathBuf>, Error> {
-    match t.get::<Value>(field)? {
+fn global_ssh_config(t: Option<&Table>, home: &Path) -> Result<Option<PathBuf>, Error> {
+    let config = match t {
+        Some(t) => t.get("config")?,
+        None => Value::Nil,
+    };
+
+    let (path, field) = match config {
+        Value::Boolean(false) => return Ok(None),
+        Value::Table(t) => {
+            if matches!(t.get("disabled")?, Value::Boolean(true)) {
+                return Ok(None);
+            }
+
+            if let Value::String(format) = t.get("format")? {
+                let format = lua_string(&format, "ssh.config.format")?;
+                // Auto currently selects OpenSSH, so only the path is needed after validation.
+                if !format.eq_ignore_ascii_case("openssh") && !format.eq_ignore_ascii_case("auto") {
+                    return Err(Error::Message(
+                        "ssh.config.format must be openssh or auto".into(),
+                    ));
+                }
+            }
+
+            (t.get("path")?, "ssh.config.path")
+        }
+        value => (value, "ssh.config"),
+    };
+
+    Ok(Some(
+        absolute_path(path, field)?.unwrap_or_else(|| home.join(".ssh/config")),
+    ))
+}
+
+fn absolute_path(value: Value, field: &str) -> Result<Option<PathBuf>, Error> {
+    match value {
         Value::String(s) => {
             let path = PathBuf::from(lua_string(&s, field)?.as_ref());
             if !path.is_absolute() {
                 return Err(Error::Message(format!(
-                    "ssh.{field} must be a non-empty absolute path"
+                    "{field} must be a non-empty absolute path"
                 )));
             }
             Ok(Some(path))
@@ -420,27 +536,113 @@ fn lua_string<'a>(value: &'a mlua::String, field: &str) -> Result<BorrowedStr<'a
 mod tests {
     use super::*;
 
+    fn evaluate(src: &str) -> Result<Config, Error> {
+        let info = HostInfo {
+            host_name: "test".into(),
+            user: "test".into(),
+            config_file: Some("/tmp/nauvim-test/init.lua".into()),
+            home_dir: "/home/nauvim-test".into(),
+            project_dirs: ProjectDirs {
+                cache_dir: "/cache".into(),
+                data_dir: "/data".into(),
+                runtime_dir: "/runtime".into(),
+            },
+        };
+        Config::evaluate(src, info, "org.example.nauvim.test", |_| Ok(()))
+            .map(|(config, ())| config)
+    }
+
+    #[test]
+    fn inherits_shared_host_params_shallowly_after_recovery() {
+        let source = r#"return {
+            hosts_default_params = {
+                nvim = { args = { "-O3" } },
+                socket = "/shared.sock",
+                policies = { plugin = { filesystem = { copy = true } } },
+                ssh = { host_name = "ignored" },
+            },
+            default_host = { socket = "/default.sock" },
+            hosts = {
+                override = {
+                    nvim = { prog = "/opt/bin/nvim" },
+                    policies = {},
+                },
+                inherit = { nvim = false, socket = {}, policies = true },
+            },
+        }"#;
+        let config = evaluate(source).unwrap();
+
+        for (alias, prog, args, socket, copy) in [
+            (None, "nvim", &["-O3"][..], "/default.sock", true),
+            (
+                Some("override"),
+                "/opt/bin/nvim",
+                &[],
+                "/shared.sock",
+                false,
+            ),
+            (Some("inherit"), "nvim", &["-O3"][..], "/shared.sock", true),
+        ] {
+            let host = config.host(alias).unwrap();
+            let program = host.nvim.resolve(None, &config.lua).unwrap();
+
+            assert_eq!(program.prog, prog, "{alias:?}");
+            assert_eq!(program.args, args, "{alias:?}");
+            assert_eq!(
+                host.socket
+                    .as_ref()
+                    .unwrap()
+                    .resolve(None, &config.lua)
+                    .unwrap(),
+                socket,
+                "{alias:?}"
+            );
+            assert_eq!(host.policies.filesystem_copy, copy, "{alias:?}");
+            assert!(!host.is_remote(), "{alias:?}");
+        }
+    }
+
+    #[test]
+    fn uses_shared_settings_for_omitted_default_host_and_builtins_for_alias_default() {
+        for (field, expected) in [("", "shared-nvim"), ("default_host = 'remote',", "nvim")] {
+            let config = evaluate(&format!(
+                "return {{ {field} hosts_default_params = {{ nvim = 'shared-nvim' }} }}"
+            ))
+            .unwrap();
+            let program = config.default_spec.nvim.resolve(None, &config.lua).unwrap();
+
+            assert_eq!(program.prog, expected, "{field}");
+        }
+
+        let error = evaluate("return { hosts_default_params = { nvim = { args = { false } } } }")
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("nvim.args element"));
+    }
+
+    #[test]
+    fn selects_native_text_input_by_default() {
+        assert!(Config::default().ime());
+
+        for (source, expected) in [
+            ("return {}", true),
+            ("return { ime = false }", false),
+            ("return { ime = true }", true),
+            ("return { ime = 'false' }", true),
+        ] {
+            assert_eq!(evaluate(source).unwrap().ime(), expected, "{source}");
+        }
+    }
+
     #[cfg(feature = "ssh")]
     #[test]
     fn defaults_both_ssh_paths_when_global_settings_are_absent() {
         for source in ["return {}", "return {ssh=nil}", "return {ssh={}}"] {
-            let info = HostInfo {
-                host_name: "test".into(),
-                user: "test".into(),
-                config_file: Some("/tmp/nauvim-test/init.lua".into()),
-                home_dir: "/home/nauvim-test".into(),
-                project_dirs: ProjectDirs {
-                    cache_dir: "/cache".into(),
-                    data_dir: "/data".into(),
-                    runtime_dir: "/runtime".into(),
-                },
-            };
-            let (config, ()) =
-                Config::evaluate(source, info, "org.example.nauvim.test", |_| Ok(())).unwrap();
+            let config = evaluate(source).unwrap();
 
             assert_eq!(
-                config.ssh_config,
-                Path::new("/home/nauvim-test/.ssh/config"),
+                config.ssh_config.as_deref(),
+                Some(Path::new("/home/nauvim-test/.ssh/config")),
                 "{source}"
             );
             assert_eq!(
@@ -448,6 +650,69 @@ mod tests {
                 Path::new("/home/nauvim-test/.ssh/known_hosts"),
                 "{source}"
             );
+        }
+    }
+
+    #[cfg(feature = "ssh")]
+    #[test]
+    fn selects_ssh_source_independently_of_known_hosts() {
+        let default = Some("/home/nauvim-test/.ssh/config");
+        for (value, expected) in [
+            ("true", default),
+            ("19", default),
+            ("false", None),
+            ("{ disabled = true, path = '', format = 'unused' }", None),
+            ("{ disabled = true, path = {}, format = {} }", None),
+            ("'/cfg/custom'", Some("/cfg/custom")),
+            (
+                "{ path = '/cfg/custom', format = 'OpEnSsH' }",
+                Some("/cfg/custom"),
+            ),
+            (
+                "{ path = '/cfg/auto', format = 'AUTO', disabled = false }",
+                Some("/cfg/auto"),
+            ),
+            ("{ path = {}, format = false, disabled = 'true' }", default),
+        ] {
+            let config = evaluate(&format!(
+                "return {{ ssh = {{ config = {value}, known_hosts = '/trusted' }} }}"
+            ))
+            .unwrap();
+
+            assert_eq!(
+                config.ssh_config.as_deref(),
+                expected.map(Path::new),
+                "{value}"
+            );
+            assert_eq!(config.known_hosts, Path::new("/trusted"));
+        }
+    }
+
+    #[test]
+    fn validates_enabled_ssh_paths_and_formats_and_independent_known_hosts() {
+        for (fields, message) in [
+            (
+                "config = ''",
+                "ssh.config must be a non-empty absolute path",
+            ),
+            (
+                "config = { path = 'relative' }",
+                "ssh.config.path must be a non-empty absolute path",
+            ),
+            (
+                "config = { format = 'other' }",
+                "ssh.config.format must be openssh or auto",
+            ),
+            (
+                "config = false, known_hosts = ''",
+                "ssh.known_hosts must be a non-empty absolute path",
+            ),
+        ] {
+            let error = evaluate(&format!("return {{ ssh = {{ {fields} }} }}"))
+                .err()
+                .unwrap();
+
+            assert_eq!(error.to_string(), message, "{fields}");
         }
     }
 

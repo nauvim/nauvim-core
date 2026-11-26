@@ -25,6 +25,7 @@ impl Default for Program {
     }
 }
 
+#[derive(Clone)]
 pub(crate) enum ProgramSetting {
     Value(Program),
     Function(Function),

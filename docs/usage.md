@@ -22,8 +22,12 @@ the client operating system, operating system family, and CPU architecture.
 Its path fields are absolute with symbolic links resolved. Its non-nil
 `config_file` identifies the selected configuration file.
 The engine prepends `ROOT/lua/?.lua;ROOT/lua/?/init.lua` to `package.path`, where
-`ROOT` is that resolved file's parent directory. Existing entries follow these
-templates. Neovim runtime directories are not added.
+`ROOT` is that resolved file's parent directory. If your frontend accepts
+additional Lua module search paths, supply filename templates such as
+`/home/user/shared-lua/?.lua`. These templates follow the two `ROOT/lua`
+templates and precede the existing entries. They are available to `require()`
+from the first statement of the Nauvim configuration file. Neovim loads its
+own configuration separately.
 
 Unknown dictionary keys and values of unsupported types are treated as omitted.
 This applies to nested dictionaries, including those in lists. When recovery
@@ -73,10 +77,12 @@ Required source errors fail the connection attempt.
 ## Host plugin permissions
 
 Set permissions for each host under `hosts[alias].policies.plugin` or
-`default_host.policies.plugin` for the independent default host. Omitted, nil,
-and empty policies grant no permissions. Destinations resolved solely through
-OpenSSH also grant no permissions. Configuration loading validates permissions
-for every configured host.
+`default_host.policies.plugin` for the independent default host. Supply
+`hosts_default_params.policies` to share a policy across host entries. After
+[shared host parameters](#shared-host-parameters) are applied, omitted, nil,
+and empty policies grant no permissions. An alias with no entry in `hosts`
+also grants no permissions. Configuration loading validates permissions for
+every configured host.
 
 ```lua
 policies = {
@@ -131,15 +137,27 @@ collection.
 | Alias string in `default_host` | Connect to that alias. |
 
 A `default_host` table configures the independent choice using the same fields
-as a named host. With nil or an alias string, the independent choice uses the
-built-in local configuration. Entries named `"local"` and `"default"` remain
-available as ordinary aliases. A configured host without `ssh` is local. A
-configured host with `ssh`, or an alias absent from `hosts`, uses SSH
-resolution. SSH destinations require the `ssh` feature.
+as a named host. With nil, the independent local choice uses
+[shared host parameters](#shared-host-parameters) and fills any remaining fields
+from built-in defaults. With an alias string, the independent choice uses the
+built-in local defaults. Entries named `"local"` and `"default"` remain available
+as ordinary aliases. A configured host without `ssh` is local. A configured host
+with `ssh`, or an alias absent from `hosts`, uses SSH resolution. SSH destinations
+require the `ssh` feature.
 
 Call `Engine::start()` once with the current UI dimensions to apply this startup
 selection. Detachment and recovery return to the welcome page without repeating
 automatic startup.
+
+### Shared host parameters
+
+Set `hosts_default_params` to share `nvim`, `socket`, or `policies` across
+named hosts. The independent default host also uses these settings when
+`default_host` is a table, omitted, or nil. Each supplied field in the host
+replaces the entire shared value. For example, a host's own `nvim` table
+replaces a shared `nvim` table, including its arguments. Omitted and nil
+host fields inherit the shared value. Core applies built-in defaults to the
+fields that are still absent. Set `ssh` on each host that requires it.
 
 ## Programs and sockets
 
@@ -208,10 +226,20 @@ a five-second timeout and attachment has a twenty-second timeout.
 
 ## SSH configuration
 
-Global `ssh.config` and `ssh.known_hosts` select the client-side OpenSSH source
-and trust file. Their defaults are `$HOME/.ssh/config` and
-`$HOME/.ssh/known_hosts`. Omit the global `ssh` table or set it to nil to use
-both defaults. Supplied paths must be non-empty absolute paths.
+Global `ssh.config` controls the client-side SSH configuration source.
+Omission, nil, and `true` enable the OpenSSH source at `$HOME/.ssh/config`.
+A string enables the OpenSSH source at the supplied path. A table can supply
+`path`, `format`, and `disabled`. The path defaults to `$HOME/.ssh/config` and
+the format defaults to `"openssh"`. Format names are case-insensitive. Core
+currently selects the OpenSSH format for `"auto"`.
+
+Set `ssh.config = false` or use `ssh.config = { disabled = true }` to use
+native settings and defaults for every destination, including jump hosts.
+Core ignores `path` and `format` when the source is disabled.
+
+Global `ssh.known_hosts` selects the trust file independently of the source.
+It defaults to `$HOME/.ssh/known_hosts`. The source path when enabled and the
+trust file path must be non-empty absolute paths in the client environment.
 
 A host's native `ssh` table accepts `host_name`, `user`, `port`, `identity_file`,
 `certificate_file`, `identity_agent`, `identities_only`, `proxy_jump`,
@@ -227,12 +255,15 @@ paths receive no tilde or environment expansion. No agent is inferred from
 Resolution gives precedence to the requested native table. Its `host_name`, or
 the requested alias when omitted, supplies a lookup name. The independent
 default host has no alias and requires `default_host.ssh.host_name` for SSH.
-One direct lookup of
-that name's native SSH table fills absent fields. If fields remain absent, the
-selected OpenSSH source supplies further settings. Native defaults apply last.
-The native merge is shallow: a supplied false, zero, or empty jump sequence
-replaces the corresponding inherited setting. Required OpenSSH-source failures
-are returned even when native settings have already supplied other fields.
+One direct lookup of that name's native SSH table fills absent fields. The
+native merge is shallow. A supplied false, zero, or empty jump sequence
+replaces the corresponding inherited setting. When the source is enabled,
+core uses it to supplement settings that remain absent and then applies native
+defaults. An error from a required source fails the connection attempt.
+
+For an SSH lookup by alias with no native SSH table, an enabled source supplies
+the settings. With the source disabled, core uses native defaults, including
+the alias as `host_name`, the client's effective user name, and port `22`.
 
 Jump hosts accept an alias, an inline SSH table, or a sequence containing both.
 Inline tables use the same supplementation rules, with `host_name` as the lookup
@@ -271,6 +302,13 @@ Bind GUI paste actions to `Engine::paste()`. Host-initiated clipboard writes
 require the host's `policies.plugin.clipboard.copy` permission. See
 [clipboard and GUI paste](implementors.md#clipboard-and-gui-paste) for input,
 event-loop, and error-handling contracts.
+
+## Native text input
+
+The top-level `ime` setting selects the attached editor's input route.
+Omission, nil, and `true` select native text input. Set `ime = false` to use
+the ordinary Neovim key path. Input method activation, source selection, and
+conversion modes are controlled by the client text input system.
 
 <a id="fonts"></a>
 

@@ -14,8 +14,8 @@ HTTP(S) file serving, GUI window requests, and clipboard exchange. Applications
 provide their own renderer and GUI windows. The separate Lua plugin is optional
 for ordinary editor operation.
 
-This implementation targets [`nauvim-spec v1.2.0`](https://github.com/nauvim/nauvim-spec/tree/v1.2.0),
-commit [`ed92e1d80610fe911074fe32aed6f2b0e510e958`](https://github.com/nauvim/nauvim-spec/commit/ed92e1d80610fe911074fe32aed6f2b0e510e958).
+This implementation targets [`nauvim-spec v1.3.0`](https://github.com/nauvim/nauvim-spec/tree/v1.3.0),
+commit [`9060ea17efd2c328892255670fd7fab9d074bb7d`](https://github.com/nauvim/nauvim-spec/commit/9060ea17efd2c328892255670fd7fab9d074bb7d).
 
 When the referenced `nauvim-spec` commit hash changes, `nauvim-core` increases its
 minor or major version. When the hash stays the same, it increases its patch
