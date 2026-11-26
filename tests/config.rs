@@ -169,6 +169,122 @@ fn retains_existing_lua_search_paths_after_local_templates() {
 }
 
 #[test]
+fn loads_user_lua_module_paths_before_evaluating_configuration() {
+    use mlua::{Lua, Table};
+
+    let dir = tempdir().unwrap();
+    let workspace = fs::canonicalize(dir.path()).unwrap();
+    let root = workspace.join("config");
+    let extra = workspace.join("extra");
+    let second = workspace.join("second");
+    fs::create_dir_all(root.join("lua")).unwrap();
+    fs::create_dir_all(&extra).unwrap();
+    fs::create_dir_all(&second).unwrap();
+    fs::write(root.join("lua/priority.lua"), "return 'local'").unwrap();
+    fs::write(extra.join("priority.lua"), "error('local path must win')").unwrap();
+    fs::write(
+        extra.join("settings.lua"),
+        "return { default_host = 'from-user-path', hosts = { ['from-user-path'] = {} } }",
+    )
+    .unwrap();
+    fs::write(
+        second.join("settings.lua"),
+        "error('first supplied path must win')",
+    )
+    .unwrap();
+
+    let first_template = format!("{}/?.lua", extra.display());
+    let second_template = format!("{}/?.lua", second.display());
+    let lua = Lua::new();
+    let package: Table = lua.globals().get("package").unwrap();
+    let original: String = package.get("path").unwrap();
+    let expected = format!(
+        "{root}/lua/?.lua;{root}/lua/?/init.lua;{first_template};{second_template};{original}",
+        root = root.display(),
+    );
+    let src = format!(
+        r#"
+        local settings = require("settings")
+        assert(require("priority") == "local")
+        assert(package.path == {})
+        return settings
+        "#,
+        lua_quote(&expected),
+    );
+    let file = root.join("custom.lua");
+    fs::write(&file, src).unwrap();
+
+    let (config, ()) = Config::load_with_module_paths(
+        Some(&file),
+        UI_ID,
+        &[&first_template, &second_template],
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert!(
+        config.diagnostics().is_empty(),
+        "{:?}",
+        config.diagnostics()
+    );
+    assert_eq!(config.default_host(), Some("from-user-path"));
+}
+
+#[test]
+fn retains_non_utf8_lua_search_paths_in_an_isolated_process() {
+    use std::env;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+    use std::process::Command;
+
+    const CHILD: &str = "NAUVIM_TEST_LUA_PATH_CHILD";
+    if let Some(file) = env::var_os(CHILD) {
+        let (config, ()) = Config::load(Some(Path::new(&file)), UI_ID, |_| Ok(())).unwrap();
+        assert!(
+            config.diagnostics().is_empty(),
+            "{:?}",
+            config.diagnostics()
+        );
+        assert_eq!(config.default_host(), Some("from-inherited-path"));
+        return;
+    }
+
+    let dir = tempdir().unwrap();
+    let file = dir.path().join("config.lua");
+    fs::write(
+        &file,
+        r#"
+        assert(package.path:find("/unused-\255/?.lua;", 1, true))
+        return require("settings")
+        "#,
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("settings.lua"),
+        "return { default_host = 'from-inherited-path', hosts = { ['from-inherited-path'] = {} } }",
+    )
+    .unwrap();
+    let mut inherited = OsString::from_vec(b"/unused-\xff/?.lua;".to_vec());
+    inherited.push(dir.path().join("?.lua"));
+
+    let output = Command::new(env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "retains_non_utf8_lua_search_paths_in_an_isolated_process",
+            "--nocapture",
+        ])
+        .env(CHILD, &file)
+        .env("LUA_PATH_5_4", inherited)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "configuration child failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+#[test]
 fn loads_default_init_in_an_isolated_process() {
     use std::env;
     use std::process::Command;

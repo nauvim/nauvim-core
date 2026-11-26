@@ -397,17 +397,17 @@ struct Resolver<'a> {
 }
 
 impl Resolver<'_> {
-    fn openssh(&mut self, alias: &str) -> Result<Settings, Error> {
+    fn openssh(&mut self, alias: &str) -> Result<Option<Settings>, Error> {
+        let Some(path) = &self.config.ssh_config else {
+            return Ok(None);
+        };
+
         if self.openssh.is_none() {
             let mut defaults = DefaultAlgorithms::empty();
             defaults.kex_algorithms = default_names(false);
             defaults.host_key_algorithms = default_names(true);
-            let file = File::open(&self.config.ssh_config).map_err(|e| {
-                message(format!(
-                    "Read SSH configuration {}: {e}",
-                    self.config.ssh_config.display()
-                ))
-            })?;
+            let file = File::open(path)
+                .map_err(|e| message(format!("Read SSH configuration {}: {e}", path.display())))?;
             let mut parser = SshConfig::default().default_algorithms(defaults);
             if let Some(info) = &self.config.client {
                 parser = parser.home_dir(&info.home_dir);
@@ -419,10 +419,7 @@ impl Resolver<'_> {
                         ParseRule::ALLOW_UNSUPPORTED_FIELDS,
                     )
                     .map_err(|e| {
-                        message(format!(
-                            "Parse SSH configuration {}: {e}",
-                            self.config.ssh_config.display()
-                        ))
+                        message(format!("Parse SSH configuration {}: {e}", path.display()))
                     })?,
             );
         }
@@ -467,7 +464,7 @@ impl Resolver<'_> {
             },
         )
         .map_err(|e| message(format!("Resolve SSH host {alias}: {e:?}")))?;
-        Ok(Settings {
+        Ok(Some(Settings {
             host_name,
             user,
             port,
@@ -488,7 +485,7 @@ impl Resolver<'_> {
             jumps,
             kex,
             keys,
-        })
+        }))
     }
 
     fn alias(&mut self, alias: &str) -> Result<Settings, Error> {
@@ -498,7 +495,7 @@ impl Resolver<'_> {
             .get(alias)
             .and_then(|host| host.ssh.as_ref());
         let Some(table) = native_table else {
-            return self.openssh(alias);
+            return Ok(self.openssh(alias)?.unwrap_or_default());
         };
         let settings = native(table)?;
         let name = settings
@@ -512,8 +509,10 @@ impl Resolver<'_> {
         if let Some(table) = self.config.hosts.get(name).and_then(|h| h.ssh.as_ref()) {
             settings = settings.defaults_from(native(table)?);
         }
-        if settings.has_absent() {
-            settings = settings.defaults_from(self.openssh(name)?);
+        if settings.has_absent()
+            && let Some(source) = self.openssh(name)?
+        {
+            settings = settings.defaults_from(source);
         }
         Ok(settings)
     }
@@ -701,7 +700,7 @@ mod tests {
                 runtime_dir: PathBuf::from("/runtime"),
             },
         });
-        config.ssh_config = PathBuf::from("/dev/null");
+        config.ssh_config = Some(PathBuf::from("/dev/null"));
         config
     }
 
@@ -825,8 +824,9 @@ mod tests {
     fn resolves_openssh_and_merges_native_overrides_without_early_defaults() {
         let dir = tempdir().unwrap();
         let mut config = config(r#"return { native = {host_name='real',identities_only=false} }"#);
-        config.ssh_config = dir.path().join("config");
-        fs::write(&config.ssh_config, "Host real\n HostName server.test\n User ssh-user\n Port 2345\n IdentitiesOnly yes\n RequestTTY force\n IdentityAgent none\n IdentityFile /ssh/id\n").unwrap();
+        let path = dir.path().join("config");
+        config.ssh_config = Some(path.clone());
+        fs::write(&path, "Host real\n HostName server.test\n User ssh-user\n Port 2345\n IdentitiesOnly yes\n RequestTTY force\n IdentityAgent none\n IdentityFile /ssh/id\n").unwrap();
         let native = resolve(&config, Some("native")).unwrap();
         assert_eq!(
             native.chain.target.dest,
@@ -847,7 +847,7 @@ mod tests {
         assert_eq!(external.chain.target.dest.name, "server.test");
         assert!(external.chain.target.auth.identities_only);
         assert_eq!(external.chain.target.tty, RequestTty::Never);
-        fs::write(&config.ssh_config, "Host real\n Port invalid\n").unwrap();
+        fs::write(&path, "Host real\n Port invalid\n").unwrap();
         assert!(resolve(&config, Some("native")).is_err());
     }
 
@@ -882,8 +882,9 @@ mod tests {
             jump={user='native-user',port=2022},
         }"#,
         );
-        config.ssh_config = dir.path().join("config");
-        fs::write(&config.ssh_config, "Host target\n Port 2222\nHost jump\n IdentityFile /ssh/jump-id\n User openssh-user\n Port 23\n").unwrap();
+        let path = dir.path().join("config");
+        config.ssh_config = Some(path.clone());
+        fs::write(&path, "Host target\n Port 2222\nHost jump\n IdentityFile /ssh/jump-id\n User openssh-user\n Port 23\n").unwrap();
         let resolved = resolve(&config, Some("target")).unwrap();
         assert_eq!(resolved.chain.target.dest.port, 2222);
         let bastions = resolved.chain.bastions.unwrap();
@@ -895,13 +896,58 @@ mod tests {
             jump.auth.identities,
             Some(vec![PathBuf::from("/ssh/jump-id")])
         );
-        fs::remove_file(&config.ssh_config).unwrap();
+        fs::remove_file(&path).unwrap();
         assert!(
             resolve(&config, Some("target"))
                 .err()
                 .unwrap()
                 .to_string()
                 .contains("Read SSH configuration")
+        );
+    }
+
+    #[test]
+    fn resolves_aliases_and_jump_hosts_with_native_settings_when_source_is_disabled() {
+        let mut config = config(
+            r#"return {
+                target = { host_name = 'native', proxy_jump = { 'unknown-jump', { host_name = 'native', user = 'inline-user' } } },
+                native = { port = 2222 },
+            }"#,
+        );
+        config.ssh_config = None;
+
+        let resolved = resolve(&config, Some("target")).unwrap();
+        assert_eq!(
+            resolved.chain.target.dest,
+            Dest {
+                name: "native".to_owned(),
+                user: "client-user".to_owned(),
+                port: 2222,
+            }
+        );
+        let bastions = resolved.chain.bastions.unwrap();
+        assert_eq!(
+            bastions.iter().map(|host| &host.dest).collect::<Vec<_>>(),
+            [
+                &Dest {
+                    name: "native".to_owned(),
+                    user: "inline-user".to_owned(),
+                    port: 2222,
+                },
+                &Dest {
+                    name: "unknown-jump".to_owned(),
+                    user: "client-user".to_owned(),
+                    port: 22,
+                },
+            ]
+        );
+        assert_eq!(
+            resolve(&config, Some("unknown")).unwrap().chain.target.dest,
+            Dest {
+                name: "unknown".to_owned(),
+                user: "client-user".to_owned(),
+                port: 22,
+            }
         );
     }
 

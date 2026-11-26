@@ -35,7 +35,7 @@ environment as the client; an SSH host is remote.
 | --- | --- |
 | `Engine` | Configuration, owned-session discovery and startup, UI attachment, RPC transport, SSH, plugin argument validation, and client resource cleanup. |
 | Your `Backend` implementation | Presentation of Neovim frame state and ordered frame events through your renderer. |
-| Your application | UI implementation ID and option schema, toolkit event loop, welcome page, host-selection controls, keyboard and GUI actions, fonts, GUI windows and tabs, error display, and process exit. |
+| Your application | UI implementation ID and option schema, toolkit event loop, welcome page, host-selection controls, key routing and native text input, GUI actions, fonts, GUI windows and tabs, error display, and process exit. |
 | Host `nauvim-plugin` | Host-side Lua entry points and clipboard-provider callbacks. Core registers and selects its RPC destination during attachment. |
 
 `Engine::new()` does not take a backend. On `EngineEvent::Frame`, your
@@ -68,7 +68,7 @@ example, with the crate's default features:
 
 ```toml
 [dependencies]
-nauvim-core = "0.2"
+nauvim-core = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 ```
 
@@ -117,6 +117,12 @@ implementation ID, and a parser for the selected UI-option dictionary. It
 returns the core configuration and the parser's result separately. See
 [UI-specific configuration](#ui-specific-configuration) for this interface.
 
+To accept additional Lua module search paths, collect filename templates
+from your application's configuration options and pass them to
+`Config::load_with_module_paths()`. Core makes them available before the
+first Lua statement. The two configuration-relative templates come first,
+then the supplied templates in order, then the existing `package.path` entries.
+
 An absent implicit configuration file selects defaults. During validation,
 core recovers unsupported dictionary keys and value types. Other loading
 failures select the complete default configuration. The engine emits retained
@@ -133,8 +139,9 @@ Create the engine, measure the editor viewport in cells, and call
 | A non-empty `default_host` alias | Connect to that alias. |
 
 Build the welcome page from `Config::hosts()` plus an independent default host
-choice. `Engine::connect_default()` selects it and uses the configured
-`default_host` table when present.
+choice. `Engine::connect_default()` selects it using the host settings
+resolved during configuration loading. See
+[startup host selection](usage.md#selecting-a-startup-host).
 `Engine::connect(alias, width, height)` selects a named host. Aliases named
 `local` and `default` are ordinary aliases, not reserved choices. An alias
 absent from the configuration uses SSH resolution when SSH is enabled.
@@ -444,22 +451,9 @@ Translate toolkit keyboard events into `KeyInput`. Use `Character` or the
 keys, and `Modifiers` for logical modifiers. Do not apply physical Shift again
 to a character already translated by the keyboard layout.
 
-Use `KeyInput::Text` for committed literal text and `KeyInput::Sequence` only
-when the source intentionally contains Neovim key notation. For example, this
-helper sends the characters `<Esc>` rather than an Escape key:
-
-```rust
-use nauvim_core::{Client, Error, KeyInput};
-
-async fn send_literal_text(client: &Client) -> Result<(), Error> {
-    client.send_key(KeyInput::Text { text: "<Esc>" }).await?;
-
-    Ok(())
-}
-```
-
-`Client::input()` interprets Neovim key notation. Calls through a client and its
-clones serialize complete keyboard sequences and retry partial input acceptance.
+Use `KeyInput::Sequence` or `Client::input()` for input already encoded in
+Neovim key notation. Calls through a client and its clones serialize complete
+keyboard sequences and retry partial input acceptance.
 Completion means Neovim accepted the input, not that it executed every key.
 Cancelling a call does not retract accepted input. Keep the application's input
 command order when scheduling these futures.
@@ -474,9 +468,40 @@ grid and include only that grid's text. These interaction rules also apply to
 plugin-created GUI windows.
 
 Report application focus changes through `Client::focus()`. It returns after
-writing the notification, without waiting for editor execution. Native IME
-integration is outside the specification's current scope; host plugins can
-provide input methods.
+writing the notification, without waiting for editor execution.
+
+### Native text input
+
+Read `Config::ime()` to select the editor's input route. The setting also
+remains available through `Engine::config()`. When native text input is
+selected, route focused editor input through the client text input system in
+every Neovim mode. Send a key event through the ordinary Neovim key path only
+when the text input system returns it for ordinary handling. The text input
+system controls activation, input source selection, and conversion modes.
+
+Keep each native text input update with its originating attachment and apply
+it only while that attachment is established. Send committed text in arrival
+order through the originating attachment's `Client` using `KeyInput::Text`.
+For example, this helper sends the five characters in `<Esc>` as literal text:
+
+```rust
+use nauvim_core::{Client, Error, KeyInput};
+
+async fn send_literal_text(client: &Client) -> Result<(), Error> {
+    client.send_key(KeyInput::Text { text: "<Esc>" }).await?;
+
+    Ok(())
+}
+```
+
+Keep preedit text local and update it only while the editor is the active
+text input target. When drawing it, use the active input position and the
+ordinary text's font selection, size, baseline, and glyph metrics. Distinguish
+preedit text visually and use any supplied composition caret, selection, or
+segment information. Provide caret or preedit geometry where the client text
+input system supports it for candidate placement. Clear pending composition
+when it ends or is cancelled, the editor stops being the active text input
+target, or the attachment ends.
 
 ## Clipboard and GUI paste
 
@@ -730,6 +755,6 @@ The core's own tests validate engine behaviour, not your toolkit adapter.
 See [development and validation](development.md) for those checks and the
 requirements of the optional live integration suites.
 
-[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.2.0/specification.md
-[ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.3/nvim_rpc_ui/
+[spec]: https://github.com/nauvim/nauvim-spec/blob/v1.3.0/specification.md
+[ui-crate]: https://docs.rs/nvim-rpc-ui/0.1.5/nvim_rpc_ui/
 [ui-protocol]: https://neovim.io/doc/user/api-ui-events/
