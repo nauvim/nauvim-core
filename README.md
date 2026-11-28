@@ -1,5 +1,7 @@
 # nauvim-core
 
+<img src="assets/nauvim-logo.svg" alt="Nauvim logo" width="160" height="160">
+
 [![crates.io](https://img.shields.io/crates/v/nauvim-core.svg)](https://crates.io/crates/nauvim-core)
 [![docs.rs](https://docs.rs/nauvim-core/badge.svg)](https://docs.rs/nauvim-core)
 
