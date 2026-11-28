@@ -1,4 +1,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/nauvim/nauvim-logo/4624a593f0030f5c78c3e4ddf7bfdf621f5279a0/dst/nauvim-logo.svg"
+)]
 
 //! UI-independent client engine for the `nauvim-spec` protocol.
 //!
