@@ -1,5 +1,9 @@
 # nauvim-core
 
+<img src="assets/nauvim-logo.svg" alt="Nauvim logo" width="160" height="160">
+
+Logo by Masato Nakata. [Source](https://github.com/nauvim/nauvim-logo) · [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+
 [![crates.io](https://img.shields.io/crates/v/nauvim-core.svg)](https://crates.io/crates/nauvim-core)
 [![docs.rs](https://docs.rs/nauvim-core/badge.svg)](https://docs.rs/nauvim-core)
 
